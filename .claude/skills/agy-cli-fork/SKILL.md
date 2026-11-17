@@ -63,12 +63,21 @@ fork/fork.sh release
 
 ## 4. 部署到 Magpie
 
+已在本机和 ecomspy 的 `wt-default-codingart-5` 上验证过（2026-11-17）：
+
 ```sh
-magpie plugin add github:ifccod/opencode-agy-cli-auth#<tag>
-magpie plugin off @magpie-community/opencode-agy-cli-auth && magpie plugin on @magpie-community/opencode-agy-cli-auth
+# 先备份 ~/.config/magpie 下的 plugin-auth.json、plugins.json、plugins.yml、plugin-providers.json、plugins/package.json
+magpie plugin rm <旧 spec>          # 旧 spec 可以是 @magpie-community/opencode-agy-cli-auth@latest，也可以是 github:…#<旧tag>
+magpie plugin add "github:ifccod/opencode-agy-cli-auth#<新tag>"
+magpie plugin                        # agy-cli 应该仍然是 signed in
 ```
 
+- 登录信息按 provider id `agy-cli` 存在 `plugin-auth.json` 里，换安装来源不会丢。
+- 插件固定在某个 tag 上，`magpie plugin update` 不会自动升级。升级就按上面的步骤，先 rm 旧来源，再 add 新 tag。
+- 正在运行的网关会自己重启插件进程，加载新代码，不用重启 Magpie 服务。可以看 `plugin-host` 进程的启动时间来确认。
+
 - ecomspy 容器的操作规矩（用 abc 用户、`/config/.local/bin/magpie`、改完还原属主）见 `/Users/cuican/Downloads/python/magpie-agy/AGENTS.md`。
+- 在容器里执行时用 `docker exec -u abc -e HOME=/config <容器> bash -c '…'`，命令里一律写绝对路径 `/config/.local/bin/magpie`。`bash -lc` 会重置 PATH，裸写 `magpie` 会跑到镜像自带的旧版 0.1.3369。
 - 部署完的验证用 `/Users/cuican/Downloads/python/magpie-agy/memory/video-input.md` 里的测试法：用 OpenAI 协议的 `image_url` 发 `data:video/mp4;base64` 或公网链接，看能不能答出画面内容和人声。
 - 换安装来源前先确认登录还在：`magpie plugin` 里 `agy-cli` 应该显示 `signed in`。
 
