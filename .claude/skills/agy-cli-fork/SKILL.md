@@ -65,6 +65,30 @@ fork/fork.sh release
 
 ## 4. 部署到 Magpie
 
+### ecomspy 上批量升级（12 个容器）
+
+装了 agy-cli 的容器名单，和 2026-11-17 各容器登录的账号，记在 `/Users/cuican/Downloads/python/magpie-agy/memory/environment.md`。动手前要重新清点一遍：只有 webtop 容器里有 `abc` 用户，看 `/config/.local/bin/magpie plugin list --json` 里有没有 `agy-cli-auth`。
+
+`fork/swap-agy-cli.sh <新spec>` 在容器里以 abc 身份运行，它会：
+
+- 备份插件配置，rm 旧来源，add 新来源。add 失败时自动把旧来源装回去。
+- 检查四项：来源对不对、登录状态和换之前是否一致、两处补丁是否都在、插件进程是否重启（最多等 60 秒）。
+- 任何一项不符就以非 0 退出。
+
+```sh
+scp fork/swap-agy-cli.sh ecomspy:/tmp/ && ssh ecomspy 'NEW="github:ifccod/opencode-agy-cli-auth#<tag>"
+for c in <容器…>; do
+  docker cp /tmp/swap-agy-cli.sh $c:/tmp/ && docker exec $c chmod 755 /tmp/swap-agy-cli.sh
+  line=$(docker exec -u abc -e HOME=/config $c /tmp/swap-agy-cli.sh "$NEW"); code=$?
+  docker exec $c rm -f /tmp/swap-agy-cli.sh; echo "$c [$code] $line"
+  [ $code = 0 ] || break
+done'
+```
+
+逐台串行执行，出问题就停下。先单独跑一台验证，再跑剩下的。插件进程重启时会打断这台容器上正在进行的 agy-cli 请求。
+
+### 单台
+
 已在本机和 ecomspy 的 `wt-default-codingart-5` 上验证过（2026-11-17）：
 
 ```sh
