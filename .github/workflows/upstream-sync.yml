@@ -1,0 +1,73 @@
+# 每 6 小时看一次上游 agy-cli；有新版本就开一个 sync/<版本> PR，交给人或 AI 审、解决冲突、合并。
+name: upstream-sync
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+
+      - name: check
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch -q origin upstream:upstream
+          set +e; fork/fork.sh check > "$RUNNER_TEMP/check.txt" 2>&1; code=$?; set -e
+          cat "$RUNNER_TEMP/check.txt"
+          if [ "$code" = 10 ]; then
+            echo "new=$(sed -n 's/.*上游 main: \([^ ]*\).*/\1/p' "$RUNNER_TEMP/check.txt")" >> "$GITHUB_OUTPUT"
+          elif [ "$code" != 0 ]; then
+            exit "$code"
+          fi
+
+      - name: sync and open PR
+        if: steps.check.outputs.new != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VER: ${{ steps.check.outputs.new }}
+        run: |
+          branch="sync/$VER"
+          if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
+            echo "$branch 已经有了，不重复开 PR"; exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          set +e; fork/fork.sh sync > "$RUNNER_TEMP/sync.txt" 2>&1; code=$?; set -e
+          cat "$RUNNER_TEMP/sync.txt"
+          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+            git add -A
+            git commit -qm "merge upstream agy-cli $VER (有冲突标记，需要解决)"
+            state="❌ 合并有冲突：冲突标记已原样提交到这个分支。搜 \`<<<<<<<\`，按 .claude/skills/agy-cli-fork/SKILL.md 第 2 节接回补丁，再跑 \`fork/fork.sh test\`。"
+          elif [ "$code" != 0 ]; then
+            state="⚠️ 合并干净，但测试没过（见下面的输出），需要修。"
+          else
+            state="✅ 合并干净，测试通过。看过上游改动就可以合并（用 Create a merge commit）。"
+          fi
+          git push -q origin upstream "$branch"
+          {
+            echo "$state"
+            echo
+            echo "### 上游变化"
+            echo '```'
+            cat "$RUNNER_TEMP/check.txt"
+            echo '```'
+            echo "### sync / test 输出（尾部）"
+            echo '```'
+            tail -n 40 "$RUNNER_TEMP/sync.txt"
+            echo '```'
+            echo "合并到 main 后，release.yml 会自动发布新的 v$VER-video.N。"
+          } > "$RUNNER_TEMP/body.md"
+          gh pr create --base main --head "$branch" --title "同步上游 agy-cli $VER" --body-file "$RUNNER_TEMP/body.md"
