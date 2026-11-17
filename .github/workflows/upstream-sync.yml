@@ -40,24 +40,30 @@ jobs:
           VER: ${{ steps.check.outputs.new }}
         run: |
           branch="sync/$VER"
+          if [ -n "$(gh pr list --head "$branch" --state all --json number --jq '.[].number')" ]; then
+            echo "$branch 已经有 PR，不重复开"; exit 0
+          fi
+          : > "$RUNNER_TEMP/sync.txt"
           if git ls-remote --exit-code --heads origin "$branch" >/dev/null; then
-            echo "$branch 已经有了，不重复开 PR"; exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          set +e; fork/fork.sh sync > "$RUNNER_TEMP/sync.txt" 2>&1; code=$?; set -e
-          cat "$RUNNER_TEMP/sync.txt"
-          git rev-parse -q --verify "refs/heads/$branch" >/dev/null || { echo "sync 没走到合并这一步，见上面的输出"; exit 1; }
-          if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
-            git add -A
-            git commit -qm "merge upstream agy-cli $VER (有冲突标记，需要解决)"
-            state="❌ 合并有冲突：冲突标记已原样提交到这个分支。搜 \`<<<<<<<\`，按 .claude/skills/agy-cli-fork/SKILL.md 第 2 节接回补丁，再跑 \`fork/fork.sh test\`。"
-          elif [ "$code" != 0 ]; then
-            state="⚠️ 合并干净，但测试没过（见下面的输出），需要修。"
+            # 上次推了分支、开 PR 失败：只补开 PR
+            state="ℹ️ 分支是上一次运行推的（那次开 PR 失败），合并和测试结果见那次 upstream-sync 的日志。"
           else
-            state="✅ 合并干净，测试通过。看过上游改动就可以合并（用 Create a merge commit）。"
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            set +e; fork/fork.sh sync > "$RUNNER_TEMP/sync.txt" 2>&1; code=$?; set -e
+            cat "$RUNNER_TEMP/sync.txt"
+            git rev-parse -q --verify "refs/heads/$branch" >/dev/null || { echo "sync 没走到合并这一步，见上面的输出"; exit 1; }
+            if git rev-parse -q --verify MERGE_HEAD >/dev/null; then
+              git add -A
+              git commit -qm "merge upstream agy-cli $VER (有冲突标记，需要解决)"
+              state="❌ 合并有冲突：冲突标记已原样提交到这个分支。搜 \`<<<<<<<\`，按 .claude/skills/agy-cli-fork/SKILL.md 第 2 节接回补丁，再跑 \`fork/fork.sh test\`。"
+            elif [ "$code" != 0 ]; then
+              state="⚠️ 合并干净，但测试没过（见下面的输出），需要修。"
+            else
+              state="✅ 合并干净，测试通过。看过上游改动就可以合并（用 Create a merge commit）。"
+            fi
+            git push -q origin upstream "$branch"
           fi
-          git push -q origin upstream "$branch"
           {
             echo "$state"
             echo
@@ -71,4 +77,5 @@ jobs:
             echo '```'
             echo "合并到 main 后，release.yml 会自动发布新的 v$VER-video.N。"
           } > "$RUNNER_TEMP/body.md"
-          gh pr create --base main --head "$branch" --title "同步上游 agy-cli $VER" --body-file "$RUNNER_TEMP/body.md"
+          gh api "repos/$GITHUB_REPOSITORY/pulls" -f base=main -f head="$branch" \
+            -f title="同步上游 agy-cli $VER" -F body=@"$RUNNER_TEMP/body.md" --jq .html_url
