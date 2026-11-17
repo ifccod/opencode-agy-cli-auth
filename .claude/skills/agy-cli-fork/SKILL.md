@@ -76,4 +76,5 @@ magpie plugin off @magpie-community/opencode-agy-cli-auth && magpie plugin on @m
 
 - `.github/workflows/upstream-sync.yml`：每 6 小时跑一次 check；有新版本时，执行 sync 并开 PR。有冲突时，把冲突标记原样提交进 PR，PR 正文里写明需要处理什么。
 - `.github/workflows/release.yml`：main 上的插件文件有变化时，自动 test + release。
+- `.github/workflows/test.yml`：PR 上有人推了提交时，跑测试并检查冲突标记。解决冲突后，等它变绿再合并。
 - 交给 AI（ChatGPT dots、Codex）处理时，只让它在 sync PR 上工作：解决冲突、补测试、合并。它不需要服务器权限，GitHub 授权也只给这一个仓库。
