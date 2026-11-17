@@ -1,0 +1,26 @@
+# PR 有人（或 AI）推了提交时跑测试，并检查有没有残留的冲突标记。
+# 注意：Actions 自己（GITHUB_TOKEN）开的 PR 和推的提交不会触发这里；sync 那一步已经跑过测试。
+name: test
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: oven-sh/setup-bun@v2
+      - name: no conflict markers
+        run: |
+          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)'; then echo "还有冲突标记"; exit 1; fi
+      - name: fork/fork.sh test
+        run: |
+          git fetch -q origin upstream:upstream
+          fork/fork.sh test
