@@ -59,6 +59,7 @@ import_ref() {
   local ref=${1:-main} sha ver wt
   sha=$(gh api "repos/$UP_REPO/commits/$ref" --jq .sha)
   ver=$(upstream_version "$sha")
+  git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "https://github.com/$UP_REPO.git"
   git fetch -q --depth=1 upstream "$sha"
   wt=$(mktemp -d)
   if git rev-parse -q --verify refs/heads/upstream >/dev/null; then
