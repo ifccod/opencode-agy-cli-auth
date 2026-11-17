@@ -94,6 +94,8 @@ done'
 
 逐台串行执行，出问题就停下。先单独跑一台验证，再跑剩下的。插件进程重启时会打断这台容器上正在进行的 agy-cli 请求。
 
+台数多时，把上面的循环写成宿主机上的脚本，用 `nohup` 在后台跑，日志写到 `/tmp/agy-rollout.log`，最后一行是 `ALLDONE` 或 `STOPPED`；本机轮询这个日志就行。直接在 ssh 里跑长循环，本机的工具一旦转到后台，命令可能一次都没执行。跑完删掉宿主机上的 `/tmp/agy-rollout.sh`、`/tmp/swap-agy-cli.sh`。
+
 ### 单台
 
 已在本机和 ecomspy 的 `wt-default-codingart-5` 上验证过（2026-11-17）：

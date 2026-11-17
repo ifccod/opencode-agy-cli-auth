@@ -12,7 +12,8 @@ spec() {
 d = json.load(sys.stdin)
 print(next((p["spec"] for p in d.get("plugins", []) if "agy-cli-auth" in p["spec"]), ""))'
 }
-host() { pgrep -o -f plugin-host/host || true; }
+# newest host: the old one can outlive the restart while it finishes its requests
+host() { pgrep -n -f plugin-host/host || true; }
 
 old=$(spec)
 before=$(state)
