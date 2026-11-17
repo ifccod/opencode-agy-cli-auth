@@ -2,10 +2,14 @@
 
 本仓库 fork 自 [magpie-community/plugins](https://github.com/magpie-community/plugins) 的 `packages/agy-cli`，npm 包名是 `@magpie-community/opencode-agy-cli-auth`。上游的 LICENSE（MIT）和 NOTICE.md 原样保留。
 
-和上游相比多两处改动，都在 `index.mjs` 里：
+和上游相比多三处改动，都在 `index.mjs` 里：
 
 1. **视频输入**：Gemini 能原生看视频，画面和声音都能处理。代码里搜 `Video (local patch)`。
 2. **容量不足报错改为 503**：agy 重试多次仍拿不到 Google 的容量时，会在结尾写一行 `⚠ Our servers are experiencing high traffic right now…`。上游插件把这行当正文、以 200 返回，客户端和外层网关都以为请求成功了。这里改成 503 `overloaded_error`，客户端会重试，外层网关会换下一个。选 503 而不是 429，是因为没容量的是这个模型，不是账号额度用完，Magpie 不应该让这个账号休息。代码里搜 `Busy ending (local patch)`。
+3. **工具被拒后不再回空**：开放 `read_file` 以后，模型有时会拿它去读客户端机器上的路径，比如 ZCode 用户 Mac 上的 `~/.zcode/...`。这个工具在服务器上跑，读媒体目录以外的路径要先申请权限，插件会拒绝；agy 被拒后就直接结束这一轮。上游插件把这样的结束原样交给客户端，结果是空正文、没有工具调用，客户端看上去就是卡住不动。现在改成两处：
+   - agent 说明里写明 `read_file` 只能读附带的视频，其他文件用客户端的工具读。
+   - 一轮在被拒的工具上结束、之后既没有正文也没有客户端工具调用时，返回 `api_error`，错误信息写明是哪个工具被拒、为什么被拒。
+   代码里搜 `Denied ending (local patch)`。
 
 ## 为什么要绕一圈
 

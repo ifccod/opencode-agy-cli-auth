@@ -40,6 +40,13 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
   5. `#onNotification` 开头那一行
   6. fetch 里 `body = await videoizeBody(JSON.parse(raw))`
 - 容量不足报错（`Busy ending (local patch)`、`BUSY_CORE`、`BUSY_MARKER`）挂在上游处理 quota 结尾的逻辑旁边：`quotaReached` 后面定义常量；`pushHeld` 里 `quotaEnding` 那一行和扣住结尾的循环条件；`quotaEnding(text, core = QUOTA_CORE)` 多了一个参数；`endText()` 里的 BUSY 分支；`#agentError` 里的 BUSY 分支；`streamErrorOf` 里 `overloaded_error` 返回 503。如果上游重写了 quota 结尾的处理，就按新写法给 BUSY 做一份等价的。`fork/patch-e2e.mjs` 能验证接得对不对。
+- 工具被拒后回空的修复（`Denied ending (local patch)`），挂在四个位置：
+  1. `agentDefinition()` 末尾，`videoOn()` 时多加一行，说明 `read_file` 只能读媒体目录；
+  2. `#onRequest` 的拒绝分支，在 `deniedPermissions++` 后面记下 `turn.denied`；
+  3. `Turn.emitText` 开头清掉 `this.denied`；
+  4. `#runTurn` 里 `turn.flushText()` 之后：`turn.denied` 还在、并且这期间没有新的客户端工具调用时，抛出 `AgentTurnError`。
+
+  `fork/patch-e2e.mjs` 的两个 denied 用例可以验证这几处接得对不对。
 - 解决原则：上游的改动全部保留，再把上面这些位置接回去。上游如果改了函数名或结构，就按新结构找等价的位置。
 - 解决完执行 `git add -A && git commit --no-edit`，再跑 `fork/fork.sh test`。
 
@@ -72,7 +79,7 @@ fork/fork.sh release
 `fork/swap-agy-cli.sh <新spec>` 在容器里以 abc 身份运行，它会：
 
 - 备份插件配置，rm 旧来源，add 新来源。add 失败时自动把旧来源装回去。
-- 检查四项：来源对不对、登录状态和换之前是否一致、两处补丁是否都在、插件进程是否重启（最多等 60 秒）。
+- 检查四项：来源对不对、登录状态和换之前是否一致、三处补丁是否都在（按 Video、Busy ending、Denied ending 三种标记数）、插件进程是否重启（最多等 60 秒）。
 - 任何一项不符就以非 0 退出。
 
 ```sh

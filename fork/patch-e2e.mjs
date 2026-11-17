@@ -89,3 +89,50 @@ test("a base64 video image block becomes a read_file prompt, and the file goes o
     assert.ok(!fs.existsSync(file), "the bridge's copy went after agy read it")
   })
 })
+
+// agy asks the client to allow its own read_file on a path outside the media
+// folder (a client path), as agy 1.5.10 does; returns the bridge's answer.
+async function askReadFile(kit, agent, file) {
+  const { child } = kit.acpSpawns[kit.acpLog.findLast((e) => e.method === "session/prompt").spawn]
+  const answered = new Promise((resolve) => {
+    const own = child.onStdin
+    child.onStdin = (chunk) => {
+      own(chunk)
+      for (const line of String(chunk).split("\n")) if (line.includes('"id":"perm"')) resolve(JSON.parse(line))
+    }
+  })
+  child.stdout.emit("data", JSON.stringify({ jsonrpc: "2.0", id: "perm", method: "session/request_permission", params: {
+    sessionId: agent.sessionId,
+    toolCall: { toolCallId: "call_rf", title: `Read ${file}`, kind: "read" },
+    options: [{ optionId: "allow", name: "Allow", kind: "allow_once" }, { optionId: "deny", name: "Deny", kind: "reject_once" }],
+  } }) + "\n")
+  return (await answered).result
+}
+
+test("a turn agy ends at its own denied read_file fails with the reason, not an empty reply", async () => {
+  await withKit(async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      const answer = await askReadFile(kit, agent, "/Users/someone/video_dl/video.mp4")
+      assert.equal(answer.outcome.optionId, "deny")
+      return { stopReason: "end_turn" }
+    }
+    const text = await (await kit.request(baseBody({ metadata: { user_id: "denied" }, messages: [{ role: "user", content: "look at /Users/someone/video_dl/video.mp4" }] }))).text()
+    const error = sseError(text)
+    assert.equal(error.type, "api_error")
+    assert.match(error.message, /agy's own tool \(Read \/Users\/someone\/video_dl\/video\.mp4\).*denied/)
+    assert.ok(!text.includes("text_delta"))
+  })
+})
+
+test("a denied read_file the model answers after is a normal reply", async () => {
+  await withKit(async (kit) => {
+    kit.defaultPrompt = async (agent) => {
+      await askReadFile(kit, agent, "/Users/someone/notes.md")
+      await agent.text("I can't open that here.")
+      return { stopReason: "end_turn" }
+    }
+    const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "denied-then-text" }, messages: [{ role: "user", content: "read /Users/someone/notes.md" }] })))
+    assert.equal(parsed.error, null)
+    assert.equal(parsed.content.filter((b) => b.type === "text").map((b) => b.text).join(""), "I can't open that here.")
+  })
+})
