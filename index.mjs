@@ -4,6 +4,7 @@ import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from
 import { once } from "node:events"
 import fs from "node:fs"
 import net from "node:net"
+import dns from "node:dns"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
@@ -189,6 +190,152 @@ const minimalAgent = () => process.env.AGY_BRIDGE_MINIMAL_AGENT === "1"
 // goes back to the session instructions.
 const systemAppend = () => /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_SYSTEM_APPEND || "")
 const FORWARD_THINKING = process.env.AGY_BRIDGE_THINKING !== "0"
+
+// Video (local patch). agy 1.5.9's ACP drops a video blob ("unsupported blob
+// type"), but its own read_file hands a video file to Gemini with picture and
+// sound. A client sends the video as an image block (OpenAI image_url with a
+// data:video/… URL or an http(s) link, which magpie passes on as-is); the
+// bridge writes it under mediaDir(), the prompt names the file, the agent may
+// read_file, and the file goes once agy has read it (agy keeps a copy of its
+// own under brain/<conversation>/.system_generated/logs/media). AGY_BRIDGE_VIDEO=0 turns it off.
+const videoOn = () => !/^(?:0|false|off|no)$/i.test(process.env.AGY_BRIDGE_VIDEO || "")
+const VIDEO_MAX_BYTES = 100 * 1024 * 1024 // agy's read_file refuses larger files
+const VIDEO_EXT = { "video/mp4": "mp4", "video/quicktime": "mov", "video/webm": "webm", "video/x-matroska": "mkv",
+  "video/mpeg": "mpeg", "video/x-msvideo": "avi", "video/3gpp": "3gp", "video/x-flv": "flv", "video/ogg": "ogv" }
+const videoUrlTypes = new Map() // url -> video mime, or "" when it isn't a video
+
+function mediaDir() {
+  const base = process.env.XDG_STATE_HOME || path.join(os.homedir(), ".local", "state")
+  return path.join(base, "magpie-agy-bridge", "media")
+}
+
+// A container's magic: the video mime, or null (ftyp images such as HEIC/AVIF are not videos).
+export function sniffVideo(buf) {
+  if (buf.length >= 12 && buf.toString("latin1", 4, 8) === "ftyp") {
+    const brand = buf.toString("latin1", 8, 12)
+    if (/^(?:heic|heix|hevc|mif1|msf1|avif|avis)$/.test(brand)) return null
+    return brand === "qt  " ? "video/quicktime" : "video/mp4"
+  }
+  if (buf.length >= 4 && buf.readUInt32BE(0) === 0x1a45dfa3) return "video/webm"
+  if (buf.length >= 12 && buf.toString("latin1", 0, 4) === "RIFF" && buf.toString("latin1", 8, 12) === "AVI ") return "video/x-msvideo"
+  return null
+}
+
+export function privateAddress(ip) {
+  if (net.isIPv4(ip)) {
+    const [a, b] = ip.split(".").map(Number)
+    return a === 0 || a === 10 || a === 127 || a >= 224 || (a === 169 && b === 254) || (a === 172 && b >= 16 && b <= 31) ||
+      (a === 192 && b === 168) || (a === 100 && b >= 64 && b <= 127)
+  }
+  const v = ip.toLowerCase()
+  if (v.startsWith("::ffff:")) return privateAddress(v.slice(7))
+  return v === "::" || v === "::1" || /^f[cd]/.test(v) || /^fe[89ab]/.test(v) || v.startsWith("ff")
+}
+
+// The video at an http(s) URL, never from a private or local address (the
+// bridge runs on the gateway's machine; a client must not reach its network).
+async function fetchVideo(url) {
+  let target = url
+  for (let hop = 0; hop < 4; hop++) {
+    const u = new URL(target)
+    if (u.protocol !== "http:" && u.protocol !== "https:") throw new UnsupportedContent("a video URL other than http(s)")
+    const host = u.hostname.replace(/^\[|\]$/g, "")
+    const addresses = net.isIP(host) ? [host] : (await dns.promises.lookup(host, { all: true })).map((a) => a.address)
+    // ponytail: checks the resolved addresses, then fetches by name: DNS rebinding in between is not covered; pin the address if untrusted keys reach this gateway
+    if (process.env.AGY_BRIDGE_VIDEO_PRIVATE !== "1" && addresses.some(privateAddress)) {
+      throw new UnsupportedContent("a video URL on a private or local address")
+    }
+    const res = await fetch(target, { redirect: "manual", signal: AbortSignal.timeout(120_000) })
+    const location = res.headers.get("location")
+    if (res.status >= 300 && res.status < 400 && location) {
+      target = new URL(location, target).href
+      continue
+    }
+    if (!res.ok) throw new UnsupportedContent(`a video URL that answered HTTP ${res.status}`)
+    if (Number(res.headers.get("content-length")) > VIDEO_MAX_BYTES) throw new UnsupportedContent("a video over 100 MB")
+    const chunks = []
+    let size = 0
+    for await (const chunk of res.body) {
+      size += chunk.length
+      if (size > VIDEO_MAX_BYTES) throw new UnsupportedContent("a video over 100 MB")
+      chunks.push(chunk)
+    }
+    const bytes = Buffer.concat(chunks)
+    const header = (res.headers.get("content-type") || "").split(";")[0].trim().toLowerCase()
+    return { bytes, type: sniffVideo(bytes) || (header.startsWith("video/") ? header : "") }
+  }
+  throw new UnsupportedContent("a video URL with more than 3 redirects")
+}
+
+// An image block that is a video, as the text naming its file, or null.
+// write: the file is put there (the newest message); earlier messages only
+// name it, the same words as when it was new, so the history still matches.
+async function videoBlock(source, write) {
+  let type = ""
+  let key = ""
+  let bytes = null
+  if (source?.type === "base64" && typeof source.data === "string" && /^video\//i.test(source.media_type || "")) {
+    type = source.media_type.toLowerCase().split(";")[0].trim()
+    key = digest(source.data)
+    if (write) bytes = Buffer.from(source.data, "base64")
+  } else if (source?.type === "url" && typeof source.url === "string" && /^https?:/i.test(source.url)) {
+    type = videoUrlTypes.get(source.url)
+    if (type === undefined || write) {
+      const got = await fetchVideo(source.url)
+      type = got.type
+      bytes = got.bytes
+      videoUrlTypes.set(source.url, type)
+      while (videoUrlTypes.size > 256) videoUrlTypes.delete(videoUrlTypes.keys().next().value)
+    }
+    if (!type) return null
+    key = digest(source.url)
+  } else {
+    return null
+  }
+  const file = path.join(mediaDir(), `${key}.${VIDEO_EXT[type] || "mp4"}`)
+  if (write && bytes) {
+    if (bytes.length > VIDEO_MAX_BYTES) throw new UnsupportedContent("a video over 100 MB")
+    await fs.promises.mkdir(mediaDir(), { recursive: true, mode: 0o700 })
+    // ponytail: files agy never read go after an hour, swept here rather than on a timer
+    for (const name of await fs.promises.readdir(mediaDir()).catch(() => [])) {
+      const old = path.join(mediaDir(), name)
+      const stat = await fs.promises.stat(old).catch(() => null)
+      if (stat && Date.now() - stat.mtimeMs > 3600_000) await fs.promises.unlink(old).catch(() => {})
+    }
+    await fs.promises.writeFile(file, bytes, { mode: 0o600 })
+  }
+  return { type: "text", text: `[Video attached: ${file} (picture and sound). Read it with read_file before answering.]` }
+}
+
+async function videoizeBody(body) {
+  if (!videoOn() || !Array.isArray(body?.messages)) return body
+  const last = body.messages.length - 1
+  let changed = false
+  const messages = []
+  for (const [index, message] of body.messages.entries()) {
+    if (message?.role !== "user" || !Array.isArray(message.content)) {
+      messages.push(message)
+      continue
+    }
+    const content = []
+    for (const block of message.content) {
+      const video = block?.type === "image" ? await videoBlock(block.source, index === last) : null
+      if (video) changed = true
+      content.push(video ?? block)
+    }
+    messages.push({ ...message, content })
+  }
+  return changed ? { ...body, messages } : body
+}
+
+// agy has read a video the bridge wrote: its own copy is kept, ours goes.
+function dropReadVideo(update) {
+  if ((update?.sessionUpdate !== "tool_call" && update?.sessionUpdate !== "tool_call_update") || update.status !== "completed") return
+  const dir = mediaDir() + path.sep
+  for (const file of [update.rawInput?.Path, ...(update.locations || []).map((l) => l?.path)]) {
+    if (typeof file === "string" && path.resolve(file).startsWith(dir)) fs.promises.unlink(file).catch(() => {})
+  }
+}
 
 // Until `agy models` answers. Gemini only: agy's ACP server decides which other
 // models a client gets, and the plugin serves no more than it offers.
@@ -1324,7 +1471,8 @@ function agentDefinition() {
     "description: Bridges only client-declared tools",
     "mainAgent: true",
     "subagent: false",
-    "tools: []",
+    // read_file: the video a client sent, under mediaDir()
+    videoOn() ? "tools: [read_file]" : "tools: []",
     // Never expose the user's global MCP servers, skills or plugins.
     "inheritMcp: false",
     "inheritCustomizations: false",
@@ -2037,6 +2185,10 @@ class Proc {
       "--ide-mcp-port", String(controlServer.address().port),
     ]
     if (this.workDir) args.push("--add-dir", this.workDir)
+    if (videoOn()) {
+      await fs.promises.mkdir(mediaDir(), { recursive: true, mode: 0o700 })
+      args.push("--add-dir", mediaDir())
+    }
     args.push(...await noDefaultCustomizationsArgs(this.agyPath))
     args.push(...await telemetryArgs(this.agyPath))
     const own = await geminiDirArgs(this.agyPath)
@@ -2311,6 +2463,7 @@ class Proc {
 
   #onNotification(method, params) {
     if (method !== "session/update" || params?.sessionId !== this.sessionId) return
+    if (videoOn()) dropReadVideo(params.update)
     if (params.update?.sessionUpdate === "config_option_update" && Array.isArray(params.update.configOptions)) {
       this.configOptions = params.update.configOptions
       this.currentSelectionKey = null
@@ -6783,7 +6936,7 @@ export const AntigravityBridgePlugin = async () => {
               const raw = init.body != null
                 ? (typeof init.body === "string" ? init.body : new TextDecoder().decode(init.body))
                 : (typeof fetchInput?.text === "function" ? await fetchInput.text() : "")
-              body = JSON.parse(raw)
+              body = await videoizeBody(JSON.parse(raw))
               validateBody(body)
             } catch (error) {
               return jsonError(error.statusCode ?? 400, error.message)
