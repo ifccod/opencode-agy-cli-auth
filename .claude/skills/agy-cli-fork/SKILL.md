@@ -39,12 +39,14 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
   4. `#spawn` 里 `--add-dir` 那一行后面
   5. `#onNotification` 开头那一行
   6. fetch 里 `body = await videoizeBody(JSON.parse(raw))`
-- 解决原则：上游的改动全部保留，再把这 6 处接回去。上游如果改了函数名或结构，就按新结构找等价的位置。
+- 容量不足报错（`Busy ending (local patch)`、`BUSY_CORE`、`BUSY_MARKER`）挂在上游处理 quota 结尾的逻辑旁边：`quotaReached` 后面定义常量；`pushHeld` 里 `quotaEnding` 那一行和扣住结尾的循环条件；`quotaEnding(text, core = QUOTA_CORE)` 多了一个参数；`endText()` 里的 BUSY 分支；`#agentError` 里的 BUSY 分支；`streamErrorOf` 里 `overloaded_error` 返回 503。如果上游重写了 quota 结尾的处理，就按新写法给 BUSY 做一份等价的。`fork/patch-e2e.mjs` 能验证接得对不对。
+- 解决原则：上游的改动全部保留，再把上面这些位置接回去。上游如果改了函数名或结构，就按新结构找等价的位置。
 - 解决完执行 `git add -A && git commit --no-edit`，再跑 `fork/fork.sh test`。
 
 测试判定：
 
-- 先跑 `fork/video-selfcheck.mjs`，再跑上游的 `bun test`，要 2–3 分钟，用后台跑，不要干等。
+- 先跑 `fork/video-selfcheck.mjs` 和 `fork/patch-e2e.mjs`（补丁打开时的端到端测试，用 testkit 的假 agy，几秒钟就跑完），再在 `AGY_BRIDGE_VIDEO=0` 下跑上游的 `bun test`，要 2–3 分钟，用后台跑，不要干等。
+- `fork/patch-e2e.mjs` 不能改名为 `*.test.mjs`，否则 `bun test` 会在视频关闭的状态下把它扫进去跑，导致失败。
 - 有失败时，脚本会在同一环境对照上游快照再跑一遍。只有上游快照通过、我们这边失败的用例才算补丁引入的问题。
 - 本机 `re2-pattern-unit` 会因为 Go 工具链版本不匹配而失败，上游快照也一样，算环境问题。
 

@@ -91,6 +91,8 @@ fail_count() { local n; n=$(sed -n 's/^ *\([0-9][0-9]*\) fail$/\1/p' "$1" | tail
 run_tests() {
   command -v bun >/dev/null || die "需要 bun（上游测试用 bun test）"
   node fork/video-selfcheck.mjs
+  # the patch itself, video on, through index.mjs and the fake agy (test/testkit.mjs)
+  AGY_BRIDGE_STORED_SIGNIN=skip bun test --timeout 120000 ./fork/patch-e2e.mjs || { echo "补丁的端到端测试失败"; return 1; }
   local log base wt added
   log=$(mktemp)
   echo "bun test（约 2–3 分钟）…"

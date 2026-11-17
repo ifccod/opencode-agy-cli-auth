@@ -2,7 +2,10 @@
 
 本仓库 fork 自 [magpie-community/plugins](https://github.com/magpie-community/plugins) 的 `packages/agy-cli`，npm 包名是 `@magpie-community/opencode-agy-cli-auth`。上游的 LICENSE（MIT）和 NOTICE.md 原样保留。
 
-和上游相比只多一项功能：Gemini 能原生看视频，画面和声音都能处理。改动全部在 `index.mjs`，代码里搜 `Video (local patch)` 就能找到。
+和上游相比多两处改动，都在 `index.mjs` 里：
+
+1. **视频输入**：Gemini 能原生看视频，画面和声音都能处理。代码里搜 `Video (local patch)`。
+2. **容量不足报错改为 503**：agy 重试多次仍拿不到 Google 的容量时，会在结尾写一行 `⚠ Our servers are experiencing high traffic right now…`。上游插件把这行当正文、以 200 返回，客户端和外层网关都以为请求成功了。这里改成 503 `overloaded_error`，客户端会重试，外层网关会换下一个。选 503 而不是 429，是因为没容量的是这个模型，不是账号额度用完，Magpie 不应该让这个账号休息。代码里搜 `Busy ending (local patch)`。
 
 ## 为什么要绕一圈
 
@@ -53,7 +56,7 @@ magpie plugin add github:ifccod/opencode-agy-cli-auth#<tag>   # 例如 v0.1.87-v
 ```sh
 fork/fork.sh check      # 上游有没有新版本
 fork/fork.sh sync       # 导入上游快照，在 sync/<版本> 分支上合并，并跑测试
-fork/fork.sh test       # 上游测试 + fork/video-selfcheck.mjs
+fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0）
 fork/fork.sh release    # 在 main 上打 v<版本>-video.<n> 标签，发 Release
 ```
 

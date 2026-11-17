@@ -142,6 +142,16 @@ const AGENT_ERROR_CORES = AGENT_ERROR_MARKERS.map((marker) => marker.trim())
 const QUOTA_CORE = "⚠ Individual quota reached"
 const QUOTA_MARKER = "\n" + QUOTA_CORE
 const quotaReached = (detail) => /\bindividual quota reached\b/i.test(detail || "")
+// Busy ending (local patch). agy's ending when every retry met Google's "no
+// capacity" 503: "⚠ Our servers are experiencing high traffic right now,
+// please try again in a minute. (UNAVAILABLE (code 503): No capacity
+// available for model gemini-3.8-flash-high on the server)". Its tail names
+// the model, so it is matched by its start, as the quota ending is. Answered
+// as text it was a 200 whose whole reply was the notice, and nothing behind
+// magpie tried again; it is a 503 overloaded_error: the model's, not the
+// account's, so the account is not rested as a 429 would.
+const BUSY_CORE = "⚠ Our servers are experiencing high traffic right now"
+const BUSY_MARKER = "\n" + BUSY_CORE
 const CREDITS_CORE = AGENT_ERROR_CORES[2]
 const VERIFY_CORE = AGENT_ERROR_CORES[5]
 // agy 1.5.8 writes each failed attempt of a model call into the reply as one
@@ -1289,6 +1299,8 @@ export function streamErrorOf(error) {
   // Google refused the account (refusedError): its status, so magpie
   // reads it as the account's refusal, not as a failed reply.
   if (type === "permission_error") out.status = 403
+  // Google had no capacity for the model (BUSY_CORE): try again or elsewhere.
+  if (type === "overloaded_error") out.status = 503
   if (error?.noRetry) out.noRetry = true
   return out
 }
@@ -1822,7 +1834,7 @@ class Turn {
         return
       }
     }
-    const quota = this.quotaEnding(text)
+    const quota = Math.max(this.quotaEnding(text), this.quotaEnding(text, BUSY_CORE))
     if (quota >= 0) {
       this.heldText = text.slice(quota)
       this.emitText(text.slice(0, quota))
@@ -1830,7 +1842,7 @@ class Turn {
     }
     for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
-      if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) || QUOTA_MARKER.startsWith(tail) ||
+      if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) || QUOTA_MARKER.startsWith(tail) || BUSY_MARKER.startsWith(tail) ||
         (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail) ||
           CAP_MARKER.startsWith(tail)))) {
         this.heldText = tail
@@ -1844,8 +1856,8 @@ class Turn {
   // Where agy's quota ending (QUOTA_CORE) starts in text, with the newline
   // before it: a line of its own that only whitespace follows, so far. -1
   // when there is none; one more text follows was the model quoting it.
-  quotaEnding(text) {
-    const at = text.lastIndexOf(QUOTA_CORE)
+  quotaEnding(text, core = QUOTA_CORE) {
+    const at = text.lastIndexOf(core)
     if (at < 0) return -1
     const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
     if (!lineStart || text.slice(at).trimEnd().includes("\n")) return -1
@@ -1932,6 +1944,11 @@ class Turn {
     } else if (this.quotaEnding(this.heldText) >= 0) {
       this.agentError = true
       this.agentErrorCore = QUOTA_CORE
+      this.quotaNotice = this.heldText.trim().replace(/^⚠ /, "")
+      this.heldText = ""
+    } else if (this.quotaEnding(this.heldText, BUSY_CORE) >= 0) {
+      this.agentError = true
+      this.agentErrorCore = BUSY_CORE
       this.quotaNotice = this.heldText.trim().replace(/^⚠ /, "")
       this.heldText = ""
     }
@@ -2704,6 +2721,9 @@ class Proc {
       // Google's own words, the reset with them: magpie rests the account
       // until then and asks the next one
       return new AgentTurnError(`agy bridge: Antigravity quota reached: ${turn.quotaNotice}`, "rate_limit_error")
+    }
+    if (core === BUSY_CORE) {
+      return new AgentTurnError(`agy bridge: Antigravity has no capacity for this model now: ${turn.quotaNotice}`, "overloaded_error")
     }
     if (core === VERIFY_CORE) {
       // the link, when agy logged Google's error whole; the reply has none
