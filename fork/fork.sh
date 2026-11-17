@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # 维护 agy-cli 分叉。上游：magpie-community/plugins 的 packages/agy-cli。
 #
-#   fork/fork.sh check          上游有没有新版本（有：退出码 10，并列出提交和改到的文件）
+#   fork/fork.sh check          上游有没有 main 还没合并的新版本（有：退出码 10，并列出提交和改到的文件）
 #   fork/fork.sh import [ref]   把上游 ref（默认 main）的 packages/agy-cli 原样快照提交到 upstream 分支
 #   fork/fork.sh sync [ref]     import，然后在 sync/<版本> 分支上合并 upstream，并跑测试
 #   fork/fork.sh test           上游测试 + 视频补丁自检
@@ -25,17 +25,18 @@ upstream_version() {
   gh api "repos/$UP_REPO/contents/$UP_DIR/package.json?ref=$1" --jq .content | base64 --decode | json_version
 }
 
-# "<version> <sha>" of the last snapshot on the upstream branch, empty before the first.
-imported() {
-  git log -1 --format=%s upstream 2>/dev/null | sed -n 's/^upstream agy-cli \([^ ]*\) (.*@\([0-9a-f]*\))$/\1 \2/p'
+# "<version> <sha>" of the newest upstream snapshot a ref holds (main: the one
+# merged; upstream: the one imported), empty before the first.
+snapshot() {
+  git log -1 --format=%s --grep='^upstream agy-cli ' "$1" 2>/dev/null | sed -n 's/^upstream agy-cli \([^ ]*\) (.*@\([0-9a-f]*\))$/\1 \2/p'
 }
 
 check() {
   local have="" have_sha="" new_sha new
-  read -r have have_sha <<<"$(imported)" || true
+  read -r have have_sha <<<"$(snapshot main)" || true
   new_sha=$(gh api "repos/$UP_REPO/commits/main" --jq .sha)
   new=$(upstream_version "$new_sha")
-  echo "已导入: ${have:-无} ${have_sha:0:9}   上游 main: $new ${new_sha:0:9}"
+  echo "main 已合并: ${have:-无} ${have_sha:0:9}   上游 main: $new ${new_sha:0:9}"
   [ "$have" = "$new" ] && { echo "已是最新"; return 0; }
   echo
   echo "上游 agy-cli 的新提交："
@@ -116,7 +117,7 @@ run_tests() {
 sync() {
   import_ref "${1:-main}"
   local ver branch
-  ver=$(imported | cut -d' ' -f1)
+  ver=$(snapshot upstream | cut -d' ' -f1)
   branch="sync/$ver"
   git diff --quiet && git diff --cached --quiet || die "工作区不干净，先提交或暂存"
   git switch -q main
