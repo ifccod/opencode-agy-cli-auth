@@ -228,7 +228,10 @@ magpie quota refresh agy-cli --json
 ```
 
 The numbers come from agy's own `/usage` report for whichever account is signed
-in to the CLI, broken down by model group. The plugin never writes Google tokens
+in to the CLI, broken down by model group. Each group's models share its
+5-hour and weekly limits, so magpie shows the groups, and under "Every model"
+each model the group names, reading the group's most used limit (the one that
+stops it; Google's own per-model figure was the group's). The plugin never writes Google tokens
 or sends them anywhere but Google; it always reports the account agy is signed in to. A window with no
 measurable data shows "Limits not available" rather than a fake 0% or 100%.
 
@@ -237,8 +240,11 @@ Where Antigravity isn't offered, agy refuses `/usage` on its eligibility check
 made had its answer. The plugin then makes that read itself, the way agy makes
 it: with agy's stored sign-in it asks Google's Code Assist server
 (`loadCodeAssist`, then `retrieveUserQuotaSummary`) with agy's own User-Agent.
-An access token about to end is renewed in memory and never stored. If that
-read fails too, the account shows agy's refusal and no numbers.
+An access token about to end is renewed in memory and never stored. When
+`loadCodeAssist` names no project for a personal Google account, the quota is
+asked under `aicode-consumers`, the project Google serves every personal account
+under (agy itself asks with none, and Google refuses that). If that read fails
+too, the account shows agy's refusal and why the read failed, and no numbers.
 
 A signed-out agy opens Google's sign-in page in the browser when it runs, so
 before running agy for usage or the model list, the plugin looks at agy's stored
@@ -369,6 +375,15 @@ off unless you turn it on.
   account's own quota is used up) ends the turn as a rate limit
   (`rate_limit_error`, HTTP 429 without streaming) carrying agy's words and
   reset, so magpie rests the account until then and asks the next one.
+- **A reply with only thinking, no text and no tool call** (billion-context's
+  "the turn degenerated again after the continuation nudge"): when one of the
+  model's replies comes back empty, agy writes "⚠ Model produced invalid
+  output." and tries again; when that try is empty too, agy ends the turn as
+  finished. The plugin doesn't hand such an ending over as the reply: it asks
+  once more in the same session, where the model still has the whole context.
+  Still empty, the turn ends with an error, so magpie asks the next account,
+  and the client sending the request again continues in that session. An
+  empty ending with no thinking either is returned as it is.
 - **HTTP 409 saying tool results do not match the history**: usually the client
   rewrote the history or tool IDs mid-conversation. When the plugin can work out
   the correct match it rebuilds the session; when it cannot, it refuses rather
