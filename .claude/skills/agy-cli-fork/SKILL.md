@@ -125,7 +125,7 @@ magpie plugin                        # agy-cli 应该仍然是 signed in
 
 ## 5. 自动化
 
-- `.github/workflows/upstream-sync.yml`：每 6 小时跑一次 check；有新版本时，执行 sync 并开 PR。有冲突时，把冲突标记原样提交进 PR，PR 正文里写明需要处理什么。
+- `.github/workflows/upstream-sync.yml`：每 6 小时跑一次 check；有新版本时，执行 sync 并开 PR。合并干净且测试通过就自动合并（merge commit）、用 `gh workflow run release.yml` 发版（Actions 自己推 main 不会触发 release），并关掉旧的 sync PR。有冲突时，把冲突标记原样提交进 PR，PR 正文里写明需要处理什么。部署到容器不自动，按第 4 节做。
 - `.github/workflows/release.yml`：main 上的插件文件有变化时，自动 test + release。
 - `.github/workflows/test.yml`：PR 上有人推了提交时，跑测试并检查冲突标记。解决冲突后，等它变绿再合并。
 - 交给 AI（ChatGPT dots、Codex）处理时，只让它在 sync PR 上工作：解决冲突、补测试、合并。它不需要服务器权限，GitHub 授权也只给这一个仓库。

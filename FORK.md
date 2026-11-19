@@ -66,8 +66,8 @@ fork/fork.sh release    # 在 main 上打 v<版本>-video.<n> 标签，发 Relea
 
 自动化（`.github/workflows/`）：
 
-- `upstream-sync.yml`：每 6 小时检查一次上游，有新版本就开一个 `sync/<版本>` PR。合并干净时，PR 里写上测试结果；有冲突时，把冲突标记原样提交进 PR，并在 PR 里说明哪里需要解决。
+- `upstream-sync.yml`：每 6 小时检查一次上游，有新版本就开一个 `sync/<版本>` PR。合并干净且测试通过时，自动用 merge commit 合并、触发 `release.yml` 发版，并关掉被它取代的旧 sync PR；部署到 Magpie 容器仍是人工。有冲突或测试没过时，把冲突标记原样提交进 PR（或写明哪些测试没过），等人处理。
 - `release.yml`：main 上的插件文件有变化时，跑测试、打 tag、发 Release。
 - `test.yml`：PR 上有人（或 AI）推了提交时，跑 `fork/fork.sh test`，并检查有没有残留的冲突标记。Actions 自己开的 PR、自己推的提交不会触发它。
 
-人或 AI（例如 ChatGPT dots）只需要处理同步 PR：看上游改了什么，解决冲突，然后合并。
+人或 AI（例如 ChatGPT dots）只需要处理没能自动合并的同步 PR：看上游改了什么，解决冲突，然后合并。
