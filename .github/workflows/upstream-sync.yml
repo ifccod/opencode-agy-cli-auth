@@ -87,10 +87,11 @@ jobs:
           echo "$url"
           [ -n "$auto" ] || exit 0
           # merge commit only: a squash or rebase makes the next upstream merge conflict everywhere
-          gh pr merge "$url" --merge
-          # a push made with GITHUB_TOKEN starts no workflow; a dispatch does
-          gh workflow run release.yml --ref main
+          gh pr merge "$url" --merge -R "$GITHUB_REPOSITORY"
+          # a push made with GITHUB_TOKEN starts no workflow; a dispatch does.
+          # -R everywhere: fork.sh adds a remote "upstream", which gh would take for the repo
+          gh workflow run release.yml --ref main -R "$GITHUB_REPOSITORY"
           # older sync PRs this one supersedes
-          for n in $(gh pr list --state open --json number,headRefName --jq ".[] | select(.headRefName | startswith(\"sync/\")) | .number"); do
-            gh pr close "$n" --comment "已被 $branch 取代，随它一起合并。"
+          for n in $(gh pr list -R "$GITHUB_REPOSITORY" --state open --json number,headRefName --jq ".[] | select(.headRefName | startswith(\"sync/\")) | .number"); do
+            gh pr close "$n" -R "$GITHUB_REPOSITORY" --comment "已被 $branch 取代，随它一起合并。"
           done
