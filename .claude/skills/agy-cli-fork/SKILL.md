@@ -39,7 +39,14 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
   4. `#spawn` 里 `--add-dir` 那一行后面
   5. `#onNotification` 开头那一行
   6. fetch 里 `body = await videoizeBody(JSON.parse(raw))`
-- 容量不足报错（`Busy ending (local patch)`、`BUSY_CORE`、`BUSY_MARKER`）挂在上游处理 quota 结尾的逻辑旁边：`quotaReached` 后面定义常量；`pushHeld` 里 `quotaEnding` 那一行和扣住结尾的循环条件；`quotaEnding(text, core = QUOTA_CORE)` 多了一个参数；`endText()` 里的 BUSY 分支；`#agentError` 里的 BUSY 分支；`streamErrorOf` 里 `overloaded_error` 返回 503。如果上游重写了 quota 结尾的处理，就按新写法给 BUSY 做一份等价的。`fork/patch-e2e.mjs` 能验证接得对不对。
+- 重发接上原回合（`Retry attach (local patch)`），挂在五个位置：
+  1. `streamResponse` 前面的 `retryKey`、`retryResponse` 两个函数，以及 `streamResponse` 里给 `turn.retry` 赋值的那一行；
+  2. `makeAnthropicStream` 开头取 `const retry = turn.retry`；
+  3. 它的 `detach` 里唤醒等待者的那一行；
+  4. `tool_use` 和 `result` 两处 `recordAssistantResponse` 后面记下 `retry.reply`；
+  5. fetch 里 `let keptSession = false` 后面、匹配工具结果之前的入口判断。
+
+  `fork/patch-e2e.mjs` 的两个 retry 用例可以验证。容量不足改 503 的补丁上游 0.1.95 已自带，不再是我们的补丁；`patch-e2e.mjs` 里的 busy 用例留着当回归测试。
 - 工具被拒后回空的修复（`Denied ending (local patch)`），挂在四个位置：
   1. `agentDefinition()` 末尾，`videoOn()` 时多加一行，说明 `read_file` 只能读媒体目录；
   2. `#onRequest` 的拒绝分支，在 `deniedPermissions++` 后面记下 `turn.denied`；
@@ -79,7 +86,7 @@ fork/fork.sh release
 `fork/swap-agy-cli.sh <新spec>` 在容器里以 abc 身份运行，它会：
 
 - 备份插件配置，rm 旧来源，add 新来源。add 失败时自动把旧来源装回去。
-- 检查四项：来源对不对、登录状态和换之前是否一致、三处补丁是否都在（按 Video、Busy ending、Denied ending 三种标记数）、插件进程是否重启（最多等 60 秒）。
+- 检查四项：来源对不对、登录状态和换之前是否一致、三处补丁是否都在（按 Video、Retry attach、Denied ending 三种标记数）、插件进程是否重启（最多等 60 秒）。
 - 任何一项不符就以非 0 退出。
 
 ```sh
