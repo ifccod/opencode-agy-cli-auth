@@ -136,3 +136,60 @@ test("a denied read_file the model answers after is a normal reply", async () =>
     assert.equal(parsed.content.filter((b) => b.type === "text").map((b) => b.text).join(""), "I can't open that here.")
   })
 })
+
+// Retry attach (local patch)
+const toolRound = (body, parsed, result) => ({ ...body, messages: [...body.messages,
+  { role: "assistant", content: parsed.content.filter((b) => b.type === "tool_use").map((b) => ({ type: "tool_use", id: b.id, name: b.name, input: b.input })) },
+  { role: "user", content: parsed.content.filter((b) => b.type === "tool_use").map((b) => ({ type: "tool_result", tool_use_id: b.id, content: result })) },
+] })
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms))
+
+test("tool results sent again while their response still runs get that response, not a 409", async () => {
+  await withKit(async (kit) => {
+    let release
+    const gate = new Promise((resolve) => { release = resolve })
+    kit.prompts.push(async (agent) => {
+      await agent.tool("Read", { path: "/a" })
+      await gate // the model thinks longer than the client waits
+      await agent.tool("Read", { path: "/b" })
+      await agent.text("done")
+      return { stopReason: "end_turn" }
+    })
+    const body = baseBody({ metadata: { user_id: "retry-attach" } })
+    const first = await readSse(await kit.request(body))
+    const second = toolRound(body, first, "A")
+    const original = kit.request(second)
+    await sleep(30)
+    const retried = kit.request(second) // the client gave up on the first byte and sent it again
+    await sleep(30)
+    release()
+    const [a, b] = await Promise.all([original.then(readSse), retried.then(readSse)])
+    const calls = (parsed) => parsed.content.filter((x) => x.type === "tool_use").map((x) => [x.id, x.input])
+    assert.equal(a.stopReason, "tool_use")
+    assert.deepEqual(calls(a).map((c) => c[1]), [{ path: "/b" }])
+    assert.deepEqual(calls(b), calls(a), "the retry got the same call")
+    assert.equal(b.usage.output_tokens, 0, "and its usage is not counted twice")
+    // the reply lost on the way: asked once more after the response ended
+    const late = await readSse(await kit.request(second))
+    assert.deepEqual(calls(late), calls(a))
+    const last = await readSse(await kit.request(toolRound(second, b, "B")))
+    assert.equal(last.content.filter((x) => x.type === "text").map((x) => x.text).join(""), "done")
+    assert.equal(kit.acpSpawns.length, 1, "one session throughout")
+    assert.equal(kit.acpLog.filter((e) => e.method === "session/prompt").length, 1, "and one prompt")
+  })
+})
+
+test("a retry of a request whose first attempt was cancelled is told to send it again", async () => {
+  await withKit(async (kit) => {
+    kit.defaultPrompt = async (agent) => { await agent.waitCancel(); return { stopReason: "cancelled" } }
+    const body = baseBody({ metadata: { user_id: "retry-cancelled" } })
+    const abort = new AbortController()
+    const original = kit.request(body, { signal: abort.signal }).then((r) => r.text()).catch(() => "")
+    await sleep(30)
+    const retried = kit.request(body).then((r) => r.text())
+    await sleep(30)
+    abort.abort()
+    await original
+    assert.equal(sseError(await retried).type, "overloaded_error")
+  })
+})
