@@ -54,6 +54,15 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
   4. `#runTurn` 里 `turn.flushText()` 之后：`turn.denied` 还在、并且这期间没有新的客户端工具调用时，抛出 `AgentTurnError`。
 
   `fork/patch-e2e.mjs` 的两个 denied 用例可以验证这几处接得对不对。
+- 并行通道（`Parallel lanes (local patch)`），挂在六个位置：
+  1. `acquireProcLocked` 前面的整段 helper（`LANE_TAG` 到 `heldFor`）；
+  2. `acquireProcLocked` 开头用 `pickLane` 取 `existing` 和 `key`（原来是 `pool.get(convKey)`，`key` 原来在后面才 `let key = convKey`，那一行已删）；
+  3. 同一函数里，上游 `lineageVerdict` 那段之前插入的 `laneWanted` 分支，以及上游 `superseded` 事件后面的 `noteSuperseded`；`findLiveContinuedProc` 的条件多了 `key === convKey`，`why` 先取 `laneWhy`，`takeParked` 用 `key`；
+  4. `recoverStaleTurn` 里 `current` 按 `ctx.proc.convKey` 取，重放时带 `laneKey`；
+  5. fetch 里 Retry attach 的入口：在整组通道里找正在跑的那一轮；
+  6. fetch 里 409 分支的 `held` 改用 `heldFor(convKey, acquireOpts, resultBlocks)`。
+
+  `fork/patch-e2e.mjs` 的四个 lanes 用例可以验证；设 `LANES_PROBE=1` 再跑这几个用例，它们应该失败（409、503、409），说明用例确实能抓到上游行为。上游测试经 `test/testkit.mjs` 跑，那里的环境变量是隔离的，外面设 `AGY_BRIDGE_MAX_LANES` 传不进去。
 - 解决原则：上游的改动全部保留，再把上面这些位置接回去。上游如果改了函数名或结构，就按新结构找等价的位置。
 - 解决完执行 `git add -A && git commit --no-edit`，再跑 `fork/fork.sh test`。
 
@@ -86,7 +95,7 @@ fork/fork.sh release
 `fork/swap-agy-cli.sh <新spec>` 在容器里以 abc 身份运行，它会：
 
 - 备份插件配置，rm 旧来源，add 新来源。add 失败时自动把旧来源装回去。
-- 检查四项：来源对不对、登录状态和换之前是否一致、三处补丁是否都在（按 Video、Retry attach、Denied ending 三种标记数）、插件进程是否重启（最多等 60 秒）。
+- 检查四项：来源对不对、登录状态和换之前是否一致、四处补丁是否都在（按 Video、Retry attach、Denied ending、Parallel lanes 四种标记数）、插件进程是否重启（最多等 60 秒）。
 - 任何一项不符就以非 0 退出。
 
 ```sh

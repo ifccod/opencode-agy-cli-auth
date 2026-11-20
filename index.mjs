@@ -3842,10 +3842,110 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   }
 }
 
+// Parallel lanes (local patch): one conversation (same user, system prompt
+// and first message, so one conversationKey) can run on more than one line at
+// once. ZCode, for one, runs a side task on the whole main conversation while
+// the main one goes on, under the same session id. Upstream keeps one agy per
+// conversation, so the line that comes second supersedes the other's tool
+// turn (or waits on its stream), the other's tool results then match nothing
+// and get 409, and each switch replays the whole history. A line seen to run
+// beside a live one gets an agy of its own instead (a lane, keyed
+// `<convKey>#lane:<hex>`); tool results already find their process by call
+// id, and later requests take the lane whose history they continue.
+// AGY_BRIDGE_MAX_LANES caps the processes of one conversation; 1 is upstream.
+const LANE_TAG = "#lane:"
+// A detached tool turn counts as a live line this soon after its client moved.
+const LANE_RECENT_MS = 2 * 60 * 1000
+const laned = new Map()
+// Calls of turns a sibling superseded: results for one coming back show the
+// conversation runs on two lines (Codex's dropped calls never come back).
+const supersededCalls = new Map()
+function noteSuperseded(convKey, turn) {
+  for (const call of turn.calls) if (call.id) supersededCalls.set(call.id, convKey)
+  while (supersededCalls.size > 512) supersededCalls.delete(supersededCalls.keys().next().value)
+}
+function maxLanes() {
+  return Math.floor(positiveTimeout(process.env.AGY_BRIDGE_MAX_LANES, 3))
+}
+function laneGroup(convKey) {
+  const out = []
+  for (const [key, proc] of pool) {
+    if ((key === convKey || key.startsWith(convKey + LANE_TAG)) && !proc.dead && !proc.retiring) out.push(proc)
+  }
+  return out
+}
+function laneRoom(convKey) {
+  return maxLanes() > 1 && laneGroup(convKey).length < maxLanes()
+}
+function newLaneKey(convKey) {
+  return pool.get(convKey) ? convKey + LANE_TAG + randomBytes(4).toString("hex") : convKey
+}
+function noteLaned(convKey) {
+  laned.delete(convKey)
+  laned.set(convKey, Date.now())
+  while (laned.size > 256) laned.delete(laned.keys().next().value)
+}
+function lanedLately(convKey) {
+  return Date.now() - (laned.get(convKey) ?? -Infinity) < IDLE_MS
+}
+// This request is another line than proc's running turn: it carries none of
+// the turn's calls, and the turn streams to someone else right now (a retry of
+// that very request was attached to it before this). A detached tool turn
+// keeps upstream's rules (one line that moved on supersedes it, unmatched
+// results get 409 then a replay), unless this conversation already ran lanes
+// lately and the turn's client is still at work on its calls.
+function laneWanted(proc, opts, convKey) {
+  const turn = proc?.turn
+  if (maxLanes() < 2 || !turn || proc.dead || proc.retiring || proc.stopping ||
+    turn.cancelRequested || turn.done || turn.finalized || turn.steering) return false
+  const ids = new Set(turn.calls.map((call) => call.id))
+  if ((opts.messages || []).some((message) => Array.isArray(message?.content) &&
+    message.content.some((block) => block?.type === "tool_use" && ids.has(block.id)))) return false
+  if (turn.attached) return true
+  return lanedLately(convKey) && pendingCallCount(turn) > 0 &&
+    Date.now() - (turn.clientProgressAt ?? turn.lastProgressAt) < LANE_RECENT_MS
+}
+// Which process of the conversation this request goes to: the line it
+// continues, else (a conversation that ran lanes lately) a new lane while
+// there is room, else the least recently used idle one. `proc: null` with a
+// key is a new process under that key.
+function pickLane(convKey, opts) {
+  const primary = pool.get(convKey)
+  if (maxLanes() < 2) return { proc: primary, key: convKey }
+  const group = laneGroup(convKey)
+  const pinned = opts.laneKey && pool.get(opts.laneKey)
+  if (pinned) return { proc: pinned, key: pinned.convKey }
+  if (group.length < 2 && !lanedLately(convKey)) return { proc: primary, key: convKey }
+  const idle = group.filter((proc) => !proc.turn)
+  const same = idle.find((proc) => proc.matchesHistory(opts.history)) ??
+    group.find((proc) => proc.turn && !laneWanted(proc, opts, convKey))
+  if (same) {
+    if (same !== primary) noteLaned(convKey)
+    return { proc: same, key: same.convKey }
+  }
+  if (group.length < maxLanes()) return { proc: null, key: newLaneKey(convKey) }
+  const lru = idle.sort((a, b) => a.lastUsed - b.lastUsed)[0]
+  return lru ? { proc: lru, key: lru.convKey } : { proc: primary, key: convKey }
+}
+// The busy line unmatched tool results belong to, for upstream's 409 or
+// recovery. None when every busy line is another's and a lane is free: the
+// request then replays in a lane of its own.
+function heldFor(convKey, opts, resultBlocks) {
+  if (maxLanes() > 1 && resultBlocks.some((block) => supersededCalls.get(block.tool_use_id) === convKey)) noteLaned(convKey)
+  const busy = laneGroup(convKey).filter((proc) => proc.turn)
+  const own = busy.find((proc) => !laneWanted(proc, opts, convKey))
+  if (own) return own
+  return busy.length && laneRoom(convKey) ? null : pool.get(convKey)
+}
+
 // Caller holds the conversation lock; recovery must not acquire it recursively.
 async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false, lockedKeys = new Set([convKey])) {
   await evictIdle()
-  let existing = pool.get(convKey)
+  // Parallel lanes (local patch)
+  const lane = pickLane(convKey, opts)
+  let existing = lane.proc
+  let key = lane.key
+  let laneWhy = existing === null && key !== convKey ? "lane" : null
   if (existing?.turn?.cancelRequested) {
     await Promise.race([existing.turn.settled, new Promise((resolve) => setTimeout(resolve, CANCEL_SETTLE_MS))])
   }
@@ -3856,6 +3956,15 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     logBridgeEvent(existing, orphan, "reclaim", staleTurnVerdict(existing, orphan).reason, opts)
     await reclaimStaleTurn(existing, orphan)
     existing = null
+  }
+  if (existing && !existing.dead && existing.turn && laneWanted(existing, opts, convKey) && laneRoom(convKey)) {
+    // Parallel lanes (local patch): another line runs here; leave it be.
+    logBridgeEvent(existing, existing.turn, "lane", existing.turn.attached ? "attached" : "pending_tool", opts,
+      { lanes: laneGroup(convKey).length + 1 })
+    noteLaned(convKey)
+    existing = null
+    key = newLaneKey(convKey)
+    laneWhy = "lane"
   }
   if (existing && !existing.dead && existing.turn) {
     let lineage = lineageVerdict(existing, existing.turn, opts)
@@ -3869,6 +3978,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       const orphan = existing.turn
       logBridgeEvent(existing, orphan, "superseded", lineage === "fork" ? "lineage_fork" : "lineage_answered", opts,
         { superseded_turn_id: orphan.turnId })
+      noteSuperseded(convKey, orphan) // Parallel lanes (local patch)
       await reclaimStaleTurn(existing, orphan, SUPERSEDED_NOTE)
       existing = null
     } else if (lineage === "conflict") {
@@ -3878,12 +3988,11 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   // A flattened, growing first message changes conversationKey, so the live
   // session is under the previous key. Reuse it when the new opening continues
   // the whole previous opening (not just a shared prefix).
-  if (!existing && !forceNew && isFreshConversation) {
+  if (!existing && !forceNew && isFreshConversation && key === convKey) {
     const candidate = findLiveContinuedProc(opts)
     if (candidate && lockedKeys.has(candidate.convKey)) existing = rekeyProc(candidate, convKey)
   }
-  let why = forceNew && opts.dropReason ? opts.dropReason : "no_live"
-  let key = convKey
+  let why = laneWhy ?? (forceNew && opts.dropReason ? opts.dropReason : "no_live")
   if (existing && !existing.dead && existing.turn && isFreshConversation && !forceNew &&
     !opts.hasToolResults && !existing.turn.cancelRequested && existing.turn.model !== opts.model) {
     // A new conversation that opens as a running one did (one system prompt and
@@ -3937,7 +4046,7 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     dropFromPool(existing)
     await existing.stop().catch(() => {})
   }
-  const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
+  const resume = forceNew || isFreshConversation ? null : takeParked(key, opts)
   // a spare runs in a folder of its own, and a resumed session needs its own
   const spare = resume?.workspace ? null : await takeSpare(agyPath, opts.workDir)
   while (!spare && allProcs.size >= maxProcs()) {
@@ -4231,7 +4340,7 @@ async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn 
 // turn is then reclaimed even if it is not provably stale (never an attached one).
 async function recoverStaleTurn(ctx) {
   return withAcquireLock(ctx.convKey, async () => {
-    const current = pool.get(ctx.convKey)
+    const current = pool.get(ctx.proc?.convKey ?? ctx.convKey) // Parallel lanes (local patch): its own key
     const held = current?.turn
     const forced = ctx.attempts != null
     const extra = forced ? { attempts: ctx.attempts } : {}
@@ -4263,7 +4372,8 @@ async function recoverStaleTurn(ctx) {
       logBridgeEvent(current, held, "replay_refused", problem, ctx.acquireOpts, extra)
       return { kind: "incomplete", turnId }
     }
-    const { proc, history } = await acquireProcLocked(ctx.agy, ctx.convKey, ctx.acquireOpts, ctx.isFresh, true)
+    const { proc, history } = await acquireProcLocked(ctx.agy, ctx.convKey,
+      { ...ctx.acquireOpts, laneKey: current.convKey }, ctx.isFresh, true)
     const turn = await ctx.begin(proc, history)
     logBridgeEvent(proc, turn, "replay_started", reason, ctx.acquireOpts, { ...extra, replaced_turn_id: held.turnId })
     return { kind: "replayed", proc, turn }
@@ -7323,10 +7433,13 @@ export const AntigravityBridgePlugin = async () => {
               // Retry attach (local patch): the request a running response answers,
               // or the one whose tool call the client never got, sent again. A
               // finished reply with no call pending is run anew, as a regenerate is.
-              const liveProc = pool.get(convKey)
+              // Parallel lanes (local patch): the response may run in any lane.
+              const retrying = [...new Set([pool.get(convKey), ...laneGroup(convKey)])].filter((proc) => proc?.turn?.retry?.key &&
+                (proc.turn.attached || proc.turn.retry.reply?.stopReason === "tool_use"))
+              const wantKey = retrying.length ? retryKey(body) : null
+              const liveProc = retrying.find((proc) => proc.turn.retry.key === wantKey)
               const liveRetry = liveProc?.turn?.retry
-              if (liveRetry?.key && (liveProc.turn.attached || liveRetry.reply?.stopReason === "tool_use") &&
-                liveRetry.key === retryKey(body)) {
+              if (liveRetry) {
                 logBridgeEvent(liveProc, liveProc.turn, "retry_attach", liveRetry.reply ? "lost_reply" : "in_flight", acquireOpts)
                 return retryResponse(liveRetry, body)
               }
@@ -7421,7 +7534,7 @@ export const AntigravityBridgePlugin = async () => {
                     return streamResponse(proc, turn, body, init.signal)
                   }
                 }
-                const held = pool.get(convKey)
+                const held = heldFor(convKey, acquireOpts, resultBlocks) // Parallel lanes (local patch)
                 if (held?.turn && !held.turn.cancelRequested) {
                   const verdict = movedOnVerdict(held.turn, body.messages) ?? staleTurnVerdict(held, held.turn)
                   let attempts

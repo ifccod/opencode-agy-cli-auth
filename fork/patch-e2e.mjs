@@ -6,8 +6,8 @@ import fs from "node:fs"
 import path from "node:path"
 import { baseBody, createBridgeKit, readSse } from "../test/testkit.mjs"
 
-async function withKit(fn) {
-  const kit = await createBridgeKit({})
+async function withKit(fn, options = {}) {
+  const kit = await createBridgeKit(options)
   try {
     return await fn(kit)
   } finally {
@@ -192,4 +192,124 @@ test("a retry of a request whose first attempt was cancelled is told to send it 
     await original
     assert.equal(sseError(await retried).type, "overloaded_error")
   })
+})
+
+// Parallel lanes (local patch)
+const textOf = (parsed) => parsed.content.filter((b) => b.type === "text").map((b) => b.text).join("")
+const replyTurn = (body, parsed, next) => ({ ...body, messages: [...body.messages,
+  { role: "assistant", content: [{ type: "text", text: textOf(parsed) }] }, { role: "user", content: next }] })
+async function withEvents(fn) {
+  const events = []
+  const write = process.stderr.write
+  process.stderr.write = function (chunk, ...args) {
+    if (String(chunk).startsWith("[agy-bridge] ")) { events.push(JSON.parse(String(chunk).slice(13))); return true }
+    return write.call(this, chunk, ...args)
+  }
+  try { return await fn(events) } finally { process.stderr.write = write }
+}
+const laneAgent = (kit, gate) => {
+  kit.defaultPrompt = async (agent) => {
+    const text = agent.prompt.map((p) => (p.type === "text" ? p.text : "")).join("")
+    const now = text.slice(text.lastIndexOf("<current_turn>") + 1)
+    if (now.includes("TOOL")) {
+      await agent.tool("Read", { path: now.includes("SIDE") ? "/side" : "/main" })
+      await agent.text(now.includes("SIDE") ? "side done" : "main done")
+      return { stopReason: "end_turn" }
+    }
+    if (now.includes("SLOW")) await gate
+    await agent.text(now.includes("SIDE") ? "side reply" : "main reply")
+    return { stopReason: "end_turn" }
+  }
+}
+const laneKit = process.env.LANES_PROBE ? { env: { AGY_BRIDGE_MAX_LANES: "1" } } : {}
+const sessionsOpened = (kit) => kit.acpLog.filter((e) => e.method === "session/new").length
+
+test("two lines of one conversation take turns with their tool rounds: no 409, and each keeps a session of its own", async () => {
+  await withEvents(async (events) => withKit(async (kit) => {
+    laneAgent(kit)
+    const first = baseBody({ metadata: { user_id: "lanes-tools" }, messages: [{ role: "user", content: "hello" }] })
+    const opened = await readSse(await kit.request(first))
+    const main = replyTurn(first, opened, "MAIN TOOL")
+    const mainCall = await readSse(await kit.request(main))
+    assert.equal(mainCall.stopReason, "tool_use")
+    // the side task starts from the same conversation while main's tool runs:
+    // upstream's rule supersedes main's waiting call, as for any line that moved on
+    const side = replyTurn(first, opened, "SIDE TOOL")
+    const sideCall = await readSse(await kit.request(side))
+    assert.equal(sideCall.stopReason, "tool_use")
+    // main was not done with it: its result comes back and replays in a lane
+    const mainRound = toolRound(main, mainCall, "main file")
+    const mainDone = await kit.request(mainRound)
+    assert.equal(mainDone.status, 200)
+    const mainEnd = await readSse(mainDone)
+    assert.equal(mainEnd.stopReason, "end_turn") // agy got the history with its result
+    const sideRound = toolRound(side, sideCall, "side file")
+    const sideDone = await kit.request(sideRound)
+    assert.equal(sideDone.status, 200)
+    const sideEnd = await readSse(sideDone)
+    assert.equal(textOf(sideEnd), "side done")
+    // from here each line goes on in its own session, no replay
+    const opens = sessionsOpened(kit)
+    assert.equal(textOf(await readSse(await kit.request(replyTurn(mainRound, mainEnd, "MAIN again")))), "main reply")
+    assert.equal(textOf(await readSse(await kit.request(replyTurn(sideRound, sideEnd, "SIDE again")))), "side reply")
+    assert.equal(sessionsOpened(kit), opens)
+    assert.deepEqual(events.filter((e) => e.action === "reject_active"), [])
+  }, laneKit))
+})
+
+test("a line that left another's running stream gets a lane at once, not a busy wait", async () => {
+  await withEvents(async (events) => withKit(async (kit) => {
+    let release
+    laneAgent(kit, new Promise((resolve) => { release = resolve }))
+    const first = baseBody({ metadata: { user_id: "lanes-stream" }, messages: [{ role: "user", content: "hello" }] })
+    const opened = await readSse(await kit.request(first))
+    const step = replyTurn(first, opened, "MAIN step")
+    const slow = replyTurn(step, await readSse(await kit.request(step)), "MAIN SLOW")
+    const running = kit.request(slow).then(readSse)
+    await sleep(30)
+    const side = await kit.request(replyTurn(first, opened, "SIDE quick"))
+    assert.equal(side.status, 200)
+    assert.equal(textOf(await readSse(side)), "side reply", "answered while main still streams")
+    release()
+    assert.equal(textOf(await running), "main reply")
+    assert.equal(events.filter((e) => e.action === "lane" && e.reason === "attached").length, 1)
+  }, laneKit))
+})
+
+test("tool results that match no call here (the conversation came back from another host) replay in a lane, not a 409", async () => {
+  await withEvents(async (events) => withKit(async (kit) => {
+    let release
+    laneAgent(kit, new Promise((resolve) => { release = resolve }))
+    const first = baseBody({ metadata: { user_id: "lanes-foreign" }, messages: [{ role: "user", content: "hello" }] })
+    const opened = await readSse(await kit.request(first))
+    const step = replyTurn(first, opened, "MAIN step")
+    const slow = replyTurn(step, await readSse(await kit.request(step)), "MAIN SLOW")
+    const running = kit.request(slow).then(readSse)
+    await sleep(30)
+    const foreignId = "toolu_" + "ab".repeat(12)
+    const foreign = replyTurn(first, opened, "SIDE read it")
+    foreign.messages.push({ role: "assistant", content: [{ type: "tool_use", id: foreignId, name: "Read", input: { path: "/x" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: foreignId, content: "x" }] })
+    const response = await kit.request(foreign)
+    assert.equal(response.status, 200)
+    await readSse(response)
+    release()
+    assert.equal(textOf(await running), "main reply")
+    assert.deepEqual(events.filter((e) => e.action === "reject_active"), [])
+  }, laneKit))
+})
+
+test("AGY_BRIDGE_MAX_LANES=1 keeps upstream's one process per conversation", async () => {
+  {
+    await withEvents(async (events) => withKit(async (kit) => {
+      laneAgent(kit)
+      const first = baseBody({ metadata: { user_id: "lanes-off" }, messages: [{ role: "user", content: "hello" }] })
+      const opened = await readSse(await kit.request(first))
+      const mainCall = await readSse(await kit.request(replyTurn(first, opened, "MAIN TOOL")))
+      assert.equal(mainCall.stopReason, "tool_use")
+      await readSse(await kit.request(replyTurn(first, opened, "SIDE TOOL")))
+      assert.equal(events.filter((e) => e.action === "superseded").length, 1)
+      assert.equal(events.filter((e) => e.action === "lane").length, 0)
+    }, { env: { AGY_BRIDGE_MAX_LANES: "1" } }))
+  }
 })
