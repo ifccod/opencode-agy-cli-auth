@@ -48,4 +48,4 @@ for _ in $(seq 1 60); do
 done
 
 echo "$old -> $now | $before -> $after | patches=$p | plugin host $h0 -> $h | backup $B"
-[ "$now" = "$NEW" ] && [ "$after" = "$before" ] && [ "$p" = 3 ] && [ -n "$h" ] && [ "$h" != "$h0" ] || exit 7
+[ "$now" = "$NEW" ] && [ "$after" = "$before" ] && [ "$p" = 4 ] && [ -n "$h" ] && [ "$h" != "$h0" ] || exit 7
