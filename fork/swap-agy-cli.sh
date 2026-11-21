@@ -38,7 +38,7 @@ fi
 now=$(spec)
 after=$(state)
 # distinct patch markers present (one per patch, however many lines carry it)
-p=$(grep -o -e "Video (local patch)" -e "Retry attach (local patch)" -e "Denied ending (local patch)" -e "Parallel lanes (local patch)" \
+p=$(grep -o -e "Video (local patch)" -e "Retry attach (local patch)" -e "Denied ending (local patch)" -e "Parallel lanes (local patch)" -e "Thinking when disabled (local patch)" \
   "$C/plugins/node_modules/@magpie-community/opencode-agy-cli-auth/index.mjs" | sort -u | wc -l | tr -d " ")
 h=""
 for _ in $(seq 1 60); do
@@ -48,4 +48,4 @@ for _ in $(seq 1 60); do
 done
 
 echo "$old -> $now | $before -> $after | patches=$p | plugin host $h0 -> $h | backup $B"
-[ "$now" = "$NEW" ] && [ "$after" = "$before" ] && [ "$p" = 4 ] && [ -n "$h" ] && [ "$h" != "$h0" ] || exit 7
+[ "$now" = "$NEW" ] && [ "$after" = "$before" ] && [ "$p" = 5 ] && [ -n "$h" ] && [ "$h" != "$h0" ] || exit 7

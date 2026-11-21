@@ -63,12 +63,17 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
   6. fetch 里 409 分支的 `held` 改用 `heldFor(convKey, acquireOpts, resultBlocks)`。
 
   `fork/patch-e2e.mjs` 的四个 lanes 用例可以验证；设 `LANES_PROBE=1` 再跑这几个用例，它们应该失败（409、503、409），说明用例确实能抓到上游行为。上游测试经 `test/testkit.mjs` 跑，那里的环境变量是隔离的，外面设 `AGY_BRIDGE_MAX_LANES` 传不进去。
+- thinking 关闭时照样转发思考（`Thinking when disabled (local patch)`），挂在两个位置：
+  1. `makeAnthropicStream` 前面的 `thinkingWhenDisabled()`；
+  2. `makeAnthropicStream` 开头 `forwardThinking` 的条件：`body.thinking?.type !== "disabled"` 之外再加 `|| thinkingWhenDisabled()`。
+
+  `fork/patch-e2e.mjs` 的两个 thinking 用例可以验证。上游 `test/smoke.mjs` 检查 disabled 时不出思考，所以 `fork/fork.sh test` 跑上游测试时设了 `AGY_BRIDGE_THINKING_WHEN_DISABLED=0`。
 - 解决原则：上游的改动全部保留，再把上面这些位置接回去。上游如果改了函数名或结构，就按新结构找等价的位置。
 - 解决完执行 `git add -A && git commit --no-edit`，再跑 `fork/fork.sh test`。
 
 测试判定：
 
-- 先跑 `fork/video-selfcheck.mjs` 和 `fork/patch-e2e.mjs`（补丁打开时的端到端测试，用 testkit 的假 agy，几秒钟就跑完），再在 `AGY_BRIDGE_VIDEO=0` 下跑上游的 `bun test`，要 2–3 分钟，用后台跑，不要干等。
+- 先跑 `fork/video-selfcheck.mjs` 和 `fork/patch-e2e.mjs`（补丁打开时的端到端测试，用 testkit 的假 agy，几秒钟就跑完），再在 `AGY_BRIDGE_VIDEO=0`、`AGY_BRIDGE_THINKING_WHEN_DISABLED=0` 下跑上游的 `bun test`，要 2–3 分钟，用后台跑，不要干等。
 - `fork/patch-e2e.mjs` 不能改名为 `*.test.mjs`，否则 `bun test` 会在视频关闭的状态下把它扫进去跑，导致失败。
 - 有失败时，脚本会在同一环境对照上游快照再跑一遍。只有上游快照通过、我们这边失败的用例才算补丁引入的问题。
 - 本机 `re2-pattern-unit` 会因为 Go 工具链版本不匹配而失败，上游快照也一样，算环境问题。
@@ -95,7 +100,7 @@ fork/fork.sh release
 `fork/swap-agy-cli.sh <新spec>` 在容器里以 abc 身份运行，它会：
 
 - 备份插件配置，rm 旧来源，add 新来源。add 失败时自动把旧来源装回去。
-- 检查四项：来源对不对、登录状态和换之前是否一致、四处补丁是否都在（按 Video、Retry attach、Denied ending、Parallel lanes 四种标记数）、插件进程是否重启（最多等 60 秒）。
+- 检查四项：来源对不对、登录状态和换之前是否一致、四处补丁是否都在（按 Video、Retry attach、Denied ending、Parallel lanes、Thinking when disabled 五种标记数）、插件进程是否重启（最多等 60 秒）。
 - 任何一项不符就以非 0 退出。
 
 ```sh

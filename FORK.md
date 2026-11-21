@@ -2,7 +2,7 @@
 
 本仓库 fork 自 [magpie-community/plugins](https://github.com/magpie-community/plugins) 的 `packages/agy-cli`，npm 包名是 `@magpie-community/opencode-agy-cli-auth`。上游的 LICENSE（MIT）和 NOTICE.md 原样保留。
 
-和上游相比多四处改动，都在 `index.mjs` 里（“容量不足报错改为 503”上游 0.1.95 已经自带，分叉里那份已删除）：
+和上游相比多五处改动，都在 `index.mjs` 里（“容量不足报错改为 503”上游 0.1.95 已经自带，分叉里那份已删除）：
 
 1. **视频输入**：Gemini 能原生看视频，画面和声音都能处理。代码里搜 `Video (local patch)`。
 2. **重发的请求接上原来那一轮**：客户端等不到首字就断开，把同一份请求再发一遍，而原请求还在跑；或者原请求的回复（一次工具调用）在路上丢了。上游插件对这种重发返回错误（0.1.106 之前一律是 409 `no active MCP call matches these tool results`，0.1.106 起原请求还在出流时是 503），要等原来那一轮结束才变，而原请求照常跑完并计费，产出没人收。现在重发的请求会等原请求出结果，拿到同一份回复，用量记 0，不重复计费。原请求失败或被取消时，重发的请求收到 503，客户端再发一次就会重新跑。已经正常结束、没有待答工具调用的回复不走这条路，再发一遍仍然重新生成。代码里搜 `Retry attach (local patch)`。
@@ -18,6 +18,7 @@
    - 带着本机没有的工具结果回来（会话被网关换到别的 Magpie 后又切回来），而这里正有一条线在出流时，也开通道重放，不回 503（0.1.106 之前是 409）。
 
    一个对话最多 `AGY_BRIDGE_MAX_LANES` 个进程（默认 3，设成 1 就是上游行为），满了就复用最久没用的空闲通道；全机进程上限仍是 `AGY_BRIDGE_MAX_PROCS`，闲置 10 分钟的进程照常回收。代码里搜 `Parallel lanes (local patch)`。
+5. **thinking 关闭时照样转发思考**：有的网关会给没提 thinking 的请求补上 `"thinking": {"type": "disabled"}`。上游插件见到 disabled 就丢掉所有思考片段，可 agy 关不掉思考：`requestedEffort()` 只是不设档位，模型照默认档位思考，常常 8–12k token、两分钟以上。这期间流里只有 `message_start` 和 ping，网关等不到真正的内容就一直扣着流（最长 4 分钟），只发 `: keepalive` 注释；ZCode 这类 ai-sdk 客户端大约 155 秒就放弃，这次生成白做了。思考片段一到网关，网关就放行，插件 15 秒一次的 ping 也就能到客户端。现在 disabled 的请求也照常转发思考（`thinking_delta`），思考块带插件平时的签名（`thinkingSignature`），回放历史时和要了 thinking 的请求一样校验。非流式回复由同一个流拼出来，同样带思考块。设 `AGY_BRIDGE_THINKING_WHEN_DISABLED=0` 退回上游行为。代码里搜 `Thinking when disabled (local patch)`。
 
 ## 为什么要绕一圈
 
@@ -40,6 +41,7 @@ agy 1.5.9 的 ACP 不收视频：用 image 块发会报 `unsupported mimeType`�
 | `AGY_BRIDGE_VIDEO` | 开启 | 设为 `0` 时退回上游行为（`tools: []`，不处理视频） |
 | `AGY_BRIDGE_VIDEO_PRIVATE` | 关闭 | 设为 `1` 时允许下载内网或本机地址的视频链接。只在可信内网里用 |
 | `AGY_BRIDGE_MAX_LANES` | 3 | 一个对话最多同时用几个 agy 进程（并行通道）。设为 `1` 退回上游的一个对话一个进程 |
+| `AGY_BRIDGE_THINKING_WHEN_DISABLED` | 开启 | 请求写了 `thinking: {type: "disabled"}` 时仍转发思考。设为 `0` 退回上游行为（丢掉思考） |
 
 限制：
 - 单个视频最大 100 MB，这是 agy `read_file` 的上限。下载超时 120 秒，最多跟 3 次重定向。
@@ -69,7 +71,7 @@ magpie plugin add github:ifccod/opencode-agy-cli-auth#<tag>   # 例如 v0.1.87-v
 ```sh
 fork/fork.sh check      # 上游有没有新版本
 fork/fork.sh sync       # 导入上游快照，在 sync/<版本> 分支上合并，并跑测试
-fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0）
+fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0、AGY_BRIDGE_THINKING_WHEN_DISABLED=0）
 fork/fork.sh release    # 在 main 上打 v<版本>-video.<n> 标签，发 Release
 ```
 

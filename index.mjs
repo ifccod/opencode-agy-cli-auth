@@ -6922,10 +6922,25 @@ function thinkingSignature(sessionId, thinking) {
     createHmac("sha256", THINKING_KEY).update(String(sessionId) + "\n" + thinking).digest("base64url")
 }
 
+// Thinking when disabled (local patch). A gateway adds thinking: {type:
+// "disabled"} to requests that never mentioned thinking, but agy can't turn
+// thinking off: requestedEffort() only leaves the effort unset, and the model
+// still thinks at its default level, often for minutes. Dropping those
+// thoughts left the stream with nothing but message_start and pings, so a
+// gateway holding the stream until real content arrives sent only keepalive
+// comments, and clients such as ZCode (ai-sdk) gave up first. The thoughts
+// now go out as usual thinking blocks with the bridge's signature, so the
+// replayed history validates as for a request that asked for thinking.
+// AGY_BRIDGE_THINKING_WHEN_DISABLED=0 drops them again, as upstream does.
+function thinkingWhenDisabled() {
+  return process.env.AGY_BRIDGE_THINKING_WHEN_DISABLED !== "0"
+}
+
 function makeAnthropicStream(proc, turn, body, msgId, signal, step = turn.registerResponse(body)) {
   const encoder = new TextEncoder()
   const responseContent = []
-  const forwardThinking = FORWARD_THINKING && body.thinking?.type !== "disabled"
+  const forwardThinking = FORWARD_THINKING &&
+    (body.thinking?.type !== "disabled" || thinkingWhenDisabled()) // Thinking when disabled (local patch)
   let blockIndex = 0
   let open = null
   let pingTimer = null
