@@ -516,6 +516,10 @@ export async function createBridgeKit(options = {}) {
     ...(options.storedSignIn === undefined ? { AGY_BRIDGE_STORED_SIGNIN: "skip" } : {}),
     // no spare agy unless a test asks: suites count spawns and ACP calls
     AGY_BRIDGE_SPARE: "0",
+    // Fork: the local patches' switches pass through, so fork/fork.sh can run
+    // upstream's suites with the patches off (a test's own env still wins).
+    ...Object.fromEntries(["AGY_BRIDGE_VIDEO", "AGY_BRIDGE_MAX_LANES", "AGY_BRIDGE_THINKING_WHEN_DISABLED"]
+      .filter((key) => process.env[key] != null).map((key) => [key, process.env[key]])),
     ...(options.env || {}),
   }
   for (const [key, value] of Object.entries(kit.env)) {

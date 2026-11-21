@@ -85,8 +85,10 @@ fail_count() { local n; n=$(sed -n 's/^ *\([0-9][0-9]*\) fail$/\1/p' "$1" | tail
 
 # Upstream tests with the video patch off (AGY_BRIDGE_VIDEO=0: the plugin must
 # then behave as upstream's, and upstream's tests say so; smoke.mjs checks
-# "tools: []") and thinking on disabled requests dropped again
-# (AGY_BRIDGE_THINKING_WHEN_DISABLED=0: smoke.mjs checks that too), plus the video selfcheck for the patch itself. A failure counts
+# "tools: []"), one process per conversation (AGY_BRIDGE_MAX_LANES=1:
+# unmatched-results.mjs wants 503 where a lane would replay) and thinking on
+# disabled requests dropped again (AGY_BRIDGE_THINKING_WHEN_DISABLED=0:
+# smoke.mjs checks that). test/testkit.mjs passes these three through, plus the video selfcheck for the patch itself. A failure counts
 # only when the upstream snapshot passes it in the same environment (a missing
 # or mismatched Go fails both).
 run_tests() {
@@ -97,7 +99,7 @@ run_tests() {
   local log base wt added
   log=$(mktemp)
   echo "bun test（约 2–3 分钟）…"
-  AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 bun test >"$log" 2>&1 || true
+  AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_MAX_LANES=1 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 bun test >"$log" 2>&1 || true
   grep -E '^ *[0-9]+ (pass|fail)$' "$log" || true
   [ -z "$(fails "$log")" ] && [ "$(fail_count "$log")" = 0 ] && return 0
   echo "有失败，对照上游快照在同一环境再跑一遍…"

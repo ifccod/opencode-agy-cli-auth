@@ -71,7 +71,7 @@ magpie plugin add github:ifccod/opencode-agy-cli-auth#<tag>   # 例如 v0.1.87-v
 ```sh
 fork/fork.sh check      # 上游有没有新版本
 fork/fork.sh sync       # 导入上游快照，在 sync/<版本> 分支上合并，并跑测试
-fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0、AGY_BRIDGE_THINKING_WHEN_DISABLED=0）
+fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0、AGY_BRIDGE_MAX_LANES=1、AGY_BRIDGE_THINKING_WHEN_DISABLED=0）
 fork/fork.sh release    # 在 main 上打 v<版本>-video.<n> 标签，发 Release
 ```
 
