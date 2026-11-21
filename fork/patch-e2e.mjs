@@ -4,7 +4,7 @@ import { test } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
 import path from "node:path"
-import { baseBody, createBridgeKit, readSse } from "../test/testkit.mjs"
+import { baseBody, createBridgeKit, readJson, readSse } from "../test/testkit.mjs"
 
 async function withKit(fn, options = {}) {
   const kit = await createBridgeKit(options)
@@ -312,4 +312,45 @@ test("AGY_BRIDGE_MAX_LANES=1 keeps upstream's one process per conversation", asy
       assert.equal(events.filter((e) => e.action === "lane").length, 0)
     }, { env: { AGY_BRIDGE_MAX_LANES: "1" } }))
   }
+})
+
+// Thinking when disabled (local patch)
+function thinkingAgent(kit) {
+  kit.defaultPrompt = async (agent) => {
+    await agent.thought("**Planning**\n\nWork it out first.")
+    await agent.text("The answer.")
+    return { stopReason: "end_turn" }
+  }
+}
+
+test("thinking: disabled still streams agy's thoughts as signed thinking_delta blocks", async () => {
+  await withKit(async (kit) => {
+    thinkingAgent(kit)
+    const body = baseBody({ metadata: { user_id: "think-off" }, thinking: { type: "disabled" },
+      messages: [{ role: "user", content: "hi" }] })
+    const streamed = await readSse(await kit.request(body))
+    const deltas = streamed.events.filter((e) => e.data?.delta?.type === "thinking_delta")
+    assert.equal(deltas.map((e) => e.data.delta.thinking).join(""), "**Planning**\n\nWork it out first.")
+    assert.equal(streamed.content[0].type, "thinking")
+    assert.match(streamed.content[0].signature, /^agyb1\.[A-Za-z0-9_-]{43}$/)
+    assert.deepEqual(streamed.content.slice(1), [{ type: "text", text: "The answer." }])
+
+    // the non-stream answer carries the same signed block
+    const json = await readJson(await kit.request({ ...body, stream: false,
+      metadata: { user_id: "think-off-json" } }))
+    assert.equal(json.content[0].type, "thinking")
+    assert.match(json.content[0].signature, /^agyb1\./)
+    assert.equal(json.content.at(-1).text, "The answer.")
+  })
+})
+
+test("AGY_BRIDGE_THINKING_WHEN_DISABLED=0 drops the thoughts of a thinking: disabled request, as upstream does", async () => {
+  await withKit(async (kit) => {
+    thinkingAgent(kit)
+    const body = baseBody({ metadata: { user_id: "think-off-upstream" }, thinking: { type: "disabled" },
+      messages: [{ role: "user", content: "hi" }] })
+    const streamed = await readSse(await kit.request(body))
+    assert.ok(!streamed.events.some((e) => e.data?.delta?.type === "thinking_delta"), "no thinking_delta")
+    assert.deepEqual(streamed.content, [{ type: "text", text: "The answer." }])
+  }, { env: { AGY_BRIDGE_THINKING_WHEN_DISABLED: "0" } })
 })
