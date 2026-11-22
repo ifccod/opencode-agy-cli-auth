@@ -10,7 +10,7 @@ import path from "node:path"
 import { fileURLToPath } from "node:url"
 import { ACCOUNT_DISABLED_REFUSED, agyRefusal, createUsageReader, verifyLinkIn, verifyRefused } from "./usage.mjs"
 import { catalogRows, storeCatalogRows } from "./model-ids.mjs"
-import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, signedInEmail, storedEmail, storedSignInNow } from "./signin.mjs"
+import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, heldByAnother, isKeptId, keepOwn, keptFor, notHeldError, signedInEmail, storedEmail, storedSignIn, storedSignInNow } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
 import { startLogin } from "./login.mjs"
 import { accountsDir, currentHome, dropHome, homeIdOfAuth, homeOf, inAccount, newHome, tokenFile } from "./account.mjs"
@@ -25,6 +25,7 @@ import { cloakUser, hint, outgoing, turnsAway } from "./cloak.mjs"
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 
 const PROVIDER_ID = "agy-cli"
+const PROVIDER_NAME = "Antigravity (local agy CLI)"
 // Client tools reach the session through a private `nc` placed first on agy's
 // PATH: agy dials `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. That is
 // how agy works, not a documented interface, and it was checked on 1.4.12 and
@@ -91,12 +92,6 @@ function mcpCommitWaitMs() {
   return 5_000
 }
 const RECLAIM_STOP_TIMEOUT_MS = 10_000
-// Repeated unmatched tool results against the same turn that made no progress:
-// attempts below the limit stay 409 (a live turn may still be waiting), the
-// limit-th attempt must end in a replay or a terminal 400, never another 409.
-const NO_PROGRESS_REPEAT_LIMIT = 3
-const NO_PROGRESS_REPEAT_WINDOW_MS = 10 * 60 * 1000
-const NO_PROGRESS_REPEAT_MAX_ENTRIES = 256
 const POOL_PRESSURE_NOTE = "agy bridge: this tool call was closed to free an agy process for another conversation; stop this turn"
 const SUPERSEDED_NOTE = "agy bridge: this tool call was superseded because the client conversation continued without it; stop this turn"
 const DROPPED_NOTE = "agy bridge: cancelled by the client, not executed; the conversation continues with the next message"
@@ -190,11 +185,25 @@ const EMPTY_REPLY_PROMPT = "Your last reply was empty. Continue: make the tool c
 // model's answer goes on after them in the same turn, so the notice is agy's
 // and is dropped (#892). Wording as observed by lili-luo/dsh-plugin-bundle
 // (dsh-llm-antigravity-acp, MIT).
+//
+// agy 1.5.12 words its malformed-function-call retry the same way, its
+// first line naming the call it turned away: "⚠ Your previous response
+// contained an improperly formatted function call: Malformed function call:
+// …", then "Please retry with a properly formatted function call", then
+// "Retries remaining: 3" (@seven_7cx, plugins#1454). Its binary builds every
+// such notice from one "%s\n%s\nRetries remaining: %d", so the notice is
+// matched by its start, "⚠ Your previous response ", and its instruction
+// line by "Please ", whatever reason and instruction follow.
+const NOTICE_CORE = "⚠ Your previous response "
+const NOTICE_MARKER = "\n" + NOTICE_CORE
+const NOTICE_TAIL_START = "Please "
 const CAP_MARKER = "\n⚠ Your previous response was cut off because it exceeded the output token limit\n"
-const CAP_CORE = CAP_MARKER.trim()
 const CAP_TAIL_CORE = "Please continue from where you left off, keeping your response shorter"
 const CAP_RETRIES_CORE = "Retries remaining: "
 const CAP_RETRIES_LINE = /^Retries remaining: ?\d+\.?$/
+// agy's lines as they start a reply or a line, with no newline before them:
+// a chunk that ends on the start of one is held (plugins#1454).
+const LINE_CORES = [...AGENT_ERROR_CORES, QUOTA_CORE, BUSY_CORE, ATTEMPT_CORE, RETRY_CORE, NOTICE_CORE]
 const HOLD_MAX = Math.max(
   ...AGENT_ERROR_MARKERS.map((marker) => marker.length), CAP_MARKER.length, CAP_TAIL_CORE.length, QUOTA_MARKER.length, BUSY_MARKER.length,
 ) - 1
@@ -1783,6 +1792,9 @@ class Turn {
     this.heldText = ""
     this.textTail = ""
     this.openBanner = -1
+    // Where, in heldText (or the text being cleaned), agy's banner was cut
+    // out with its newlines: a line starts there (plugins#1454).
+    this.cuts = []
     this.capPending = false
     this.attemptDetail = ""
     // What the model gave since the turn began or since its last tool
@@ -1909,7 +1921,10 @@ class Turn {
     if (!final) this.toolResponseCount++
     const total = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens
     const estimate = this.stepInputEstimates[step.estimateIndex] || step.inputEstimate
-    if (calibrate && total > 0) {
+    // A response sharing an earlier generation reports that generation's
+    // window as read, not a prompt of its own: it teaches neither the
+    // tokenizer scale nor the cache ratio.
+    if (calibrate && total > 0 && step.usageKind !== "agy_same_generation") {
       this.proc.inputTokenScale = Math.max(0.5, Math.min(1.5, total / estimate))
       this.proc.lastCacheRatio = Math.max(0, Math.min(1, usage.cache_read_input_tokens / total))
     }
@@ -1979,39 +1994,51 @@ class Turn {
   }
 
   pushHeld(chunk) {
-    let text = this.dropRetryBanner(this.heldText + chunk)
-    this.heldText = ""
-    if (this.openBanner >= 0) {
-      this.heldText = text.slice(this.openBanner)
-      this.emitText(text.slice(0, this.openBanner))
-      return
-    }
+    const text = this.dropRetryBanner(this.heldText + chunk)
+    this.holdFrom(text, this.heldFrom(text))
+  }
+
+  // Where in text the part withheld for now starts: text.length when none is.
+  heldFrom(text) {
+    if (this.openBanner >= 0) return this.openBanner
     for (const core of AGENT_ERROR_CORES) {
       const marker = text.lastIndexOf(core)
-      if (marker >= 0 && !text.slice(marker + core.length).trim()) {
-        const start = text[marker - 1] === "\n" ? marker - 1 : marker
-        this.heldText = text.slice(start)
-        this.emitText(text.slice(0, start))
-        return
-      }
+      if (marker >= 0 && !text.slice(marker + core.length).trim()) return this.lineFrom(text, marker)
     }
     const quota = Math.max(this.quotaEnding(text), this.quotaEnding(text, BUSY_CORE))
-    if (quota >= 0) {
-      this.heldText = text.slice(quota)
-      this.emitText(text.slice(0, quota))
-      return
-    }
+    if (quota >= 0) return quota
     for (let keep = Math.min(text.length, HOLD_MAX); keep > 0; keep--) {
       const tail = text.slice(-keep)
       if (AGENT_ERROR_MARKERS.some((marker) => marker.startsWith(tail)) || QUOTA_MARKER.startsWith(tail) ||
         BUSY_MARKER.startsWith(tail) || (keep > 1 && (RETRY_MARKER.startsWith(tail) || ATTEMPT_MARKER.startsWith(tail) ||
-          CAP_MARKER.startsWith(tail)))) {
-        this.heldText = tail
-        text = text.slice(0, -keep)
-        break
+          NOTICE_MARKER.startsWith(tail) || CAP_MARKER.startsWith(tail))) ||
+        (this.startsLine(text, text.length - keep) && LINE_CORES.some((core) => core.startsWith(tail)))) {
+        return text.length - keep
       }
     }
-    this.emitText(text)
+    return text.length
+  }
+
+  // Sends text up to `at` and withholds the rest, keeping the cuts that
+  // fall in what is withheld (one at its very start included).
+  holdFrom(text, at) {
+    this.heldText = text.slice(at)
+    this.cuts = this.cuts.filter((cut) => cut >= at).map((cut) => cut - at)
+    this.emitText(text.slice(0, at))
+  }
+
+  // Whether text[at] starts a line: after a newline, where agy's banner was
+  // cut out with its newlines, or at the start when what went before ended
+  // a line or the reply has not begun.
+  startsLine(text, at) {
+    if (this.cuts.includes(at)) return true
+    return at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
+  }
+
+  // Where agy's line at `at` starts with its newline: the newline before it,
+  // unless that is the model's own, left where an earlier banner was cut.
+  lineFrom(text, at) {
+    return at > 0 && text[at - 1] === "\n" && !this.cuts.includes(at) ? at - 1 : at
   }
 
   // Where agy's quota ending (QUOTA_CORE), or another ending matched by its
@@ -2021,9 +2048,8 @@ class Turn {
   quotaEnding(text, core = QUOTA_CORE) {
     const at = text.lastIndexOf(core)
     if (at < 0) return -1
-    const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
-    if (!lineStart || text.slice(at).trimEnd().includes("\n")) return -1
-    return at > 0 ? at - 1 : at
+    if (!this.startsLine(text, at) || text.slice(at).trimEnd().includes("\n")) return -1
+    return this.lineFrom(text, at)
   }
 
   // Removes agy's retry banners, each with its leading and one trailing
@@ -2032,16 +2058,27 @@ class Turn {
   // quotes one mid-line is kept. Until the turn's text is flushed, a banner
   // that ends the buffer is left in place and openBanner says where, so
   // pushText holds it and its newline in the next chunk goes with it.
+  //
+  // A banner's newlines both go with it, so where one was cut out is
+  // remembered as the start of a line (cuts): agy writes banners one after
+  // another with one newline between them, and a quota ending can follow
+  // one (plugins#1454).
   dropRetryBanner(text, final = false) {
     this.openBanner = -1
     let from = 0
+    const cut = (start, end) => {
+      text = text.slice(0, start) + text.slice(end)
+      this.cuts = this.cuts.filter((at) => at < start || at >= end).map((at) => (at < start ? at : at - (end - start)))
+      if (!this.cuts.includes(start)) this.cuts.push(start)
+      from = start
+    }
     for (;;) {
       if (this.capPending) {
         const end = text.indexOf("\n", from)
         const line = text.slice(from, end < 0 ? text.length : end)
         if (CAP_RETRIES_LINE.test(line)) {
           this.capPending = false
-          text = text.slice(0, from) + text.slice(end < 0 ? text.length : end + 1)
+          cut(from, end < 0 ? text.length : end + 1)
           continue
         }
         if (!final && CAP_RETRIES_CORE.startsWith(line)) {
@@ -2052,13 +2089,12 @@ class Turn {
       }
       const at = nextBanner(text, from)
       if (at < 0) return text
-      const lineStart = at > 0 ? text[at - 1] === "\n" : this.textTail === "" || this.textTail === "\n"
-      if (!lineStart) {
+      if (!this.startsLine(text, at)) {
         from = at + 1
         continue
       }
-      const start = at > 0 ? at - 1 : at
-      if (text.startsWith(CAP_CORE, at)) {
+      const start = this.lineFrom(text, at)
+      if (text.startsWith(NOTICE_CORE, at)) {
         const cap = capNoticeEnd(text, at, final)
         if (cap.end < 0) {
           // agy's notice is still streaming: hold it with its lines' newlines
@@ -2068,8 +2104,7 @@ class Turn {
         // The notice's "Retries remaining" line is its own line, so it can
         // arrive in the next chunk after the two lines before it.
         this.capPending = cap.retries
-        text = text.slice(0, start) + text.slice(cap.end)
-        from = start
+        cut(start, cap.end)
         continue
       }
       const attempt = !text.startsWith(RETRY_CORE, at)
@@ -2086,8 +2121,7 @@ class Turn {
       if (attempt) this.attemptDetail = ATTEMPT_LINE.exec(text.slice(at, end))?.[1]?.trim() || this.attemptDetail
       if (attempt && refused429(this.attemptDetail)) this.refusedDetail ||= this.attemptDetail
       if (text[end] === "\n") end++
-      text = text.slice(0, start) + text.slice(end)
-      from = start
+      cut(start, end)
     }
   }
 
@@ -2131,8 +2165,7 @@ class Turn {
   flushText() {
     if (!this.heldText || this.agentError) return
     const text = this.dropRetryBanner(this.heldText, true)
-    this.heldText = ""
-    this.emitText(text)
+    this.holdFrom(text, text.length)
   }
 
   complete(result) {
@@ -2317,6 +2350,10 @@ class Proc {
     this.listWaiters = []
     this.watchers = new Set()
     this.deniedPermissions = 0
+    // How long each step of starting agy took, in ms, for the session row
+    // of the bridge's events (initialize, session/new, the model's options)
+    this.phases = {}
+    this.sessionPrompts = 0
     allProcs.add(this)
   }
 
@@ -2333,9 +2370,11 @@ class Proc {
     this.openingText = openingTextOf(opts.messages?.[0])
     this.openingImages = openingImagesOf(opts.messages?.[0])
     this.resumeFrom = opts.resume || null
+    this.stateless = statelessRequest(opts)
   }
 
   async start() {
+    this.phases = {}
     await this.#spawn()
     await this.#withStartTimeout(async () => {
       await this.#initialize()
@@ -2356,10 +2395,47 @@ class Proc {
     this.#assign(convKey, opts)
     this.spareKey = null
     this.lastUsed = Date.now()
+    this.phases = {}
+    await this.#withStartTimeout(() => this.#openSession())
+  }
+
+  // A stateless request (statelessRequest) takes an idle agy that served
+  // one before and opens its own session there. agy boots its backend on a
+  // process's first session/new (it signs in and asks Google for the
+  // account, models and settings: ~3s here, far longer over a slow
+  // proxy); a later session/new in the same process takes milliseconds.
+  // The session the agy had is closed: its request was answered, and a
+  // follow-up to it replays its history in a session of its own, as after
+  // any lost session.
+  async reuse(convKey, opts) {
+    const previous = this.sessionId
+    this.#assign(convKey, opts)
+    this.sessionId = null
+    this.currentModel = null
+    this.configOptions = []
+    this.currentSelectionKey = null
+    this.instructionsInSession = false
+    this.resumed = false
+    this.hasSentFirstTurn = false
+    this.historyInvalid = false
+    this.unsentPrompt = null
+    this.expectedMessages = null
+    this.omittedHistoryTokens = 0
+    this.lastCacheRatio = undefined
+    this.pendingFlattenedTurn = undefined
+    this.deniedPermissions = 0
+    this.inputTokenScale = 1
+    this.lastUsed = Date.now()
+    this.phases = {}
+    if (previous && this.closable) {
+      // agy holds a closed session no longer; one it can't close stays
+      this.conn.request("session/close", { sessionId: previous }, 10_000).catch(() => {})
+    }
     await this.#withStartTimeout(() => this.#openSession())
   }
 
   async #spawn() {
+    this.launchKey = await launchKey(this.agyPath, this.workDir)
     await ensureControlServer()
     const bin = await ensureShimDir()
     sessions.set(this.token, this)
@@ -2461,6 +2537,7 @@ class Proc {
   }
 
   async #initialize() {
+    const started = Date.now()
     const init = await this.conn.request("initialize", {
       protocolVersion: 1,
       // The plugin's own name. agy decides which models it offers this client,
@@ -2476,6 +2553,8 @@ class Proc {
       capabilities.prompt_capabilities?.image === true
     this.appendable = capabilities._meta?.antigravity?.systemPrompt?.append === true
     this.resumable = !!(capabilities.sessionCapabilities?.resume ?? capabilities.session_capabilities?.resume)
+    this.closable = !!(capabilities.sessionCapabilities?.close ?? capabilities.session_capabilities?.close)
+    this.phases.initialize_ms = Date.now() - started
   }
 
   async #openSession() {
@@ -2486,6 +2565,8 @@ class Proc {
       : {}
 
     let session = null
+    this.sessionPrompts = 0
+    const opened = Date.now()
     if (this.resumeFrom && resumable) {
       try {
         session = await this.conn.request("session/resume", {
@@ -2508,11 +2589,14 @@ class Proc {
       if (!session?.sessionId) throw new Error("agy session/new returned no sessionId")
       this.sessionId = session.sessionId
     }
+    this.phases.session_ms = Date.now() - opened
     // A resumed session reports the account default; always apply the selection.
     this.currentModel = session?.models?.currentModelId ?? null
     this.configOptions = Array.isArray(session?.configOptions) ? session.configOptions : []
     inAccount(this.home, () => noteOfferedModels(this.configOptions, session?.models))
+    const configured = Date.now()
     if (this.model) await this.#setModel(this.model, this.selection, this.resumed)
+    this.phases.set_model_ms = Date.now() - configured
     if (this.tools.length) await this.#waitForToolList(this.toolsVersion)
     if (!this.toolsListed()) throw toolsUnlistedError(this.tools.length)
   }
@@ -2683,6 +2767,10 @@ class Proc {
     const turn = this.turn
     if (!turn || turn.done || turn.finalized) return
     const update = params.update ?? {}
+    if (turn.firstOutputAt == null && turn.promptSentAt != null &&
+      (update.sessionUpdate === "agent_message_chunk" || update.sessionUpdate === "agent_thought_chunk")) {
+      turn.firstOutputAt = Date.now()
+    }
     turn.arm()
     turn.noteAcpToolUpdate(update)
     if (turn.cancelRequested) return
@@ -2734,7 +2822,20 @@ class Proc {
   matchesHistory(messages) {
     if (this.historyInvalid) return false
     if (this.expectedMessages == null) return !this.turn && !this.hasSentFirstTurn
-    if (historyKey(this.expectedMessages) === historyKey(messages)) return true
+    const expectedKey = historyKey(this.expectedMessages)
+    const actualKey = historyKey(messages)
+    if (expectedKey === actualKey) return true
+    // magpie's masking can mask a text the session already has differently
+    // on a later request: the local model that missed it under load (the
+    // rules masked it alone) reads it for a later one, and a value in an
+    // earlier message becomes a {{KIND_xxxxxxxx}} placeholder. The history
+    // is the same one, so the session holds (yetone/magpie#7223).
+    if (sameHistoryUpToMasking(this.expectedMessages, messages)) return true
+    // A proxy between the client and magpie (billion-context's nudge) can
+    // add text after a step's tool results for one request; the client never
+    // had it, so the next request's history goes on without it
+    // (yetone/magpie#7223).
+    if (droppedOneRequestText(this.expectedMessages, messages)) return true
     // Clients such as Claude Code canonicalize tool_use.input when they
     // persist history (e.g. filling default replace_all: false). The live
     // session still has the model-issued arguments. historyKey already
@@ -2742,9 +2843,18 @@ class Proc {
     // historyKey miss) requires the raw tool_use id+name sequence to line
     // up before ignoring input values. An exact match can still succeed if
     // only ids changed and inputs did not.
-    return sameToolUseIdentities(this.expectedMessages, messages) &&
-      historyKey(stripToolUseInputs(this.expectedMessages)) ===
-        historyKey(stripToolUseInputs(messages))
+    if (sameToolUseIdentities(this.expectedMessages, messages)) {
+      const expectedStripped = stripToolUseInputs(this.expectedMessages)
+      const actualStripped = stripToolUseInputs(messages)
+      if (historyKey(expectedStripped) === historyKey(actualStripped) ||
+        sameHistoryUpToMasking(expectedStripped, actualStripped)) return true
+    }
+    // A client that compacts its own context (billion-context in DeepSeek
+    // Harness) folds earlier messages into a summary the live session never
+    // saw. agy still holds those messages whole, so the session holds as long
+    // as everything after the client's summary is what the session has
+    // (plugins#1401: each fold dropped the session and replayed ~10 KB).
+    return compactedEarlierHistory(this.expectedMessages, messages)
   }
 
   // Clients such as Claude Code normalize tool_use inputs when recording an
@@ -2850,6 +2960,8 @@ class Proc {
         promptParts = userTurnParts(promptParts)
         const promptNumber = turn.beginPrompt(promptParts, lateCalls)
         turn.promptInFlight = true
+        this.sessionPrompts++
+        if (turn.promptSentAt == null) turn.promptSentAt = Date.now()
         let result
         try {
           result = await this.conn.request("session/prompt", {
@@ -2858,6 +2970,14 @@ class Proc {
           })
         } finally {
           turn.promptInFlight = false
+        }
+        if (promptNumber === 1) {
+          // how long agy took to answer, beside the session row's start-up steps
+          const now = Date.now()
+          logSessionEvent(this, this.sessionReason ?? null, {
+            ttft_ms: turn.firstOutputAt != null ? turn.firstOutputAt - turn.promptSentAt : null,
+            prompt_ms: now - turn.promptSentAt,
+          }, "prompt")
         }
         usage = turn.recordPromptUsage(promptNumber, result?.usage)
         if (turn.cancelRequested) {
@@ -3448,10 +3568,11 @@ async function lastAgentError(file, offset) {
   return found.trim().slice(0, 1000)
 }
 
-// Where agy's output-cap notice ends, given where it starts. The notice is its
-// notice line, its "please continue" instruction and its "Retries remaining"
-// count; a line that is neither is the model's and stays. -1 means the buffer
-// still ends inside the notice; `retries` says the count line is still owed.
+// Where agy's three-line notice (the output cap's, a malformed call's) ends,
+// given where it starts. The notice is its notice line, its "Please …"
+// instruction and its "Retries remaining" count; a line that is neither is
+// the model's and stays. -1 means the buffer still ends inside the notice;
+// `retries` says the count line is still owed.
 function capNoticeEnd(text, at, final) {
   const lineAt = (from) => {
     const end = text.indexOf("\n", from)
@@ -3461,10 +3582,10 @@ function capNoticeEnd(text, at, final) {
   if (pos < 0) return { end: final ? text.length : -1, retries: false }
   pos += 1
   const tail = lineAt(pos)
-  if (tail.value === CAP_TAIL_CORE) {
+  if (tail.value.startsWith(NOTICE_TAIL_START)) {
     if (tail.end < 0) return { end: final ? text.length : -1, retries: false }
     pos = tail.end + 1
-  } else if (!final && CAP_TAIL_CORE.startsWith(tail.value)) {
+  } else if (!final && tail.end < 0 && NOTICE_TAIL_START.startsWith(tail.value)) {
     return { end: -1, retries: false }
   } else {
     return { end: pos, retries: false }
@@ -3478,7 +3599,7 @@ function capNoticeEnd(text, at, final) {
 
 // Where the next retry banner of either kind starts, from `from` on.
 function nextBanner(text, from) {
-  const found = [RETRY_CORE, ATTEMPT_CORE, CAP_CORE]
+  const found = [RETRY_CORE, ATTEMPT_CORE, NOTICE_CORE]
     .map((core) => text.indexOf(core, from))
     .filter((at) => at >= 0)
   return found.length ? Math.min(...found) : -1
@@ -3822,16 +3943,19 @@ async function acquireProc(agyPath, convKey, opts, isFreshConversation, forceNew
   // the new key (sorted, to avoid deadlock), then pick again inside those
   // locks. A process is re-keyed only when its current key is already held.
   let extra = null
+  const launch = !forceNew && isFreshConversation && statelessRequest(opts)
+    ? await launchKey(agyPath, opts.workDir).catch(() => null) : null
   for (let attempt = 0; ; attempt++) {
     const keys = extra && extra !== convKey ? [convKey, extra] : [convKey]
     const outcome = await withAcquireLocks(keys, async () => {
       const locked = new Set(keys)
-      if (isFreshConversation && !forceNew && !pool.get(convKey)) {
-        const candidate = findLiveContinuedProc(opts)
+      if (!forceNew && !pool.get(convKey)) {
+        const candidate = (isFreshConversation ? findLiveContinuedProc(opts) : findRemaskedProc(convKey, opts)) ??
+          findStatelessDonor(opts, launch)
         const needed = candidate?.convKey
         if (needed && !locked.has(needed) && attempt < 2) return { retry: needed }
       }
-      const value = await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked)
+      const value = await acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew, locked, launch)
       return { value: begin ? { ...value, turn: await begin(value.proc, value.history) } : value }
     })
     if (outcome.retry) {
@@ -3939,7 +4063,7 @@ function heldFor(convKey, opts, resultBlocks) {
 }
 
 // Caller holds the conversation lock; recovery must not acquire it recursively.
-async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false, lockedKeys = new Set([convKey])) {
+async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, forceNew = false, lockedKeys = new Set([convKey]), launch = null) {
   await evictIdle()
   // Parallel lanes (local patch)
   const lane = pickLane(convKey, opts)
@@ -3992,7 +4116,17 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
     const candidate = findLiveContinuedProc(opts)
     if (candidate && lockedKeys.has(candidate.convKey)) existing = rekeyProc(candidate, convKey)
   }
+<<<<<<< HEAD
   let why = laneWhy ?? (forceNew && opts.dropReason ? opts.dropReason : "no_live")
+=======
+  if (!existing && !forceNew && !isFreshConversation) {
+    const candidate = findRemaskedProc(convKey, opts)
+    if (candidate && lockedKeys.has(candidate.convKey)) existing = rekeyProc(candidate, convKey)
+  }
+  let why = forceNew && opts.dropReason ? opts.dropReason : "no_live"
+  let historyDiff
+  let key = convKey
+>>>>>>> upstream
   if (existing && !existing.dead && existing.turn && isFreshConversation && !forceNew &&
     !opts.hasToolResults && !existing.turn.cancelRequested && existing.turn.model !== opts.model) {
     // A new conversation that opens as a running one did (one system prompt and
@@ -4041,12 +4175,28 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
         existing.workDir !== opts.workDir ? "work_dir" :
         !sameInstructions(existing.instructions, opts.instructions) ? "instructions" :
         !(existing.matchesHistory(matchedHistory) || continuedFresh) ? "history" : "fresh_after_first"
+      // where the history first differs from the session's, with no text,
+      // as drop_live logs it (yetone/magpie#7223)
+      if (why === "history") historyDiff = firstHistoryDiff(existing.expectedMessages, matchedHistory)
+    }
+    if (!forceNew && launch && statelessRequest(opts) &&
+      statelessDonor(existing, launch, opts.userId || "", opts.sessionScope || "", opts.workDir)) {
+      // the same stateless request again: its agy answers it in a new session
+      return await reuseStateless(existing, key, opts, why)
     }
     existing.retiring = true
     dropFromPool(existing)
     await existing.stop().catch(() => {})
   }
+<<<<<<< HEAD
   const resume = forceNew || isFreshConversation ? null : takeParked(key, opts)
+=======
+  if (!forceNew && isFreshConversation && launch) {
+    const donor = findStatelessDonor(opts, launch)
+    if (donor && lockedKeys.has(donor.convKey) && key === convKey) return await reuseStateless(donor, key, opts, "stateless_reuse")
+  }
+  const resume = forceNew || isFreshConversation ? null : takeParked(convKey, opts)
+>>>>>>> upstream
   // a spare runs in a folder of its own, and a resumed session needs its own
   const spare = resume?.workspace ? null : await takeSpare(agyPath, opts.workDir)
   while (!spare && allProcs.size >= maxProcs()) {
@@ -4072,11 +4222,41 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   warmSpare(agyPath, opts.workDir).catch(() => {})
   // Why this request got a new agy session, so a cache that never hits can be
   // traced to the check that failed (#1058). Counts only, never content.
+  proc.sessionReason = why
   logSessionEvent(proc, why, {
     fresh: !!isFreshConversation, resumed: !!proc.resumed, spare: !!spare,
     parked: !!resume, history: Array.isArray(opts.history) ? opts.history.length : null,
+    ...historyDiff !== undefined ? { first_diff: historyDiff } : {},
+    ...proc.phases,
   })
   return { proc, history: opts.history }
+}
+
+// Open a stateless request's session in an idle agy that answered one
+// (findStatelessDonor), instead of starting another: agy's first session/new
+// boots its backend and takes seconds, a later one milliseconds. The
+// donor's conversation keeps no live session: a follow-up to it replays its
+// history, as after any lost session.
+async function reuseStateless(donor, key, opts, why) {
+  const previousKey = donor.convKey
+  dropFromPool(donor)
+  // its session is closed, and resuming it elsewhere would share this agy's folder
+  unpark(previousKey)
+  try {
+    await donor.reuse(key, opts)
+  } catch (error) {
+    donor.retiring = true
+    await donor.stop().catch(() => {})
+    throw error
+  }
+  pool.set(key, donor)
+  donor.sessionReason = why
+  logSessionEvent(donor, why, {
+    fresh: true, resumed: false, spare: false, parked: false, reused: true,
+    history: Array.isArray(opts.history) ? opts.history.length : null,
+    ...donor.phases,
+  })
+  return { proc: donor, history: opts.history }
 }
 
 // Bounded, content-free events: never log prompts, arguments, results or tool IDs.
@@ -4135,34 +4315,14 @@ function logBridgeEvent(proc, turn, action, reason, meta = {}, extra = {}) {
 let sessionWindowStart = 0
 let sessionWindowCount = 0
 
-function logSessionEvent(proc, reason, extra) {
+function logSessionEvent(proc, reason, extra, action = "session_new") {
   if (process.env.AGY_BRIDGE_EVENTS === "0") return
   const now = Date.now()
   if (now - sessionWindowStart >= EVENT_WINDOW_MS) { sessionWindowStart = now; sessionWindowCount = 0 }
   if (sessionWindowCount++ >= EVENT_MAX_PER_WINDOW) return
   const row = { event: "agy_bridge_session", host_epoch: HOST_EPOCH, ts: now,
-    conv: proc?.convKey ? digest(proc.convKey).slice(0, 12) : null, action: "session_new", reason, ...extra }
+    conv: proc?.convKey ? digest(proc.convKey).slice(0, 12) : null, action, reason, ...extra }
   try { process.stderr.write("[agy-bridge] " + JSON.stringify(row) + "\n") } catch {}
-}
-
-// Per-conversation counter of consecutive unmatched tool-result requests that
-// hit the same turn while its lastProgressAt did not move. A different turn,
-// any progress, a window timeout or a reclaim restarts it from zero.
-const noProgressRepeats = new Map()
-
-function noteNoProgressRepeat(convKey, turn, now = Date.now()) {
-  let entry = noProgressRepeats.get(convKey)
-  if (!entry || entry.turnId !== turn.turnId || entry.progressAt !== turn.lastProgressAt ||
-    now - entry.firstAt > NO_PROGRESS_REPEAT_WINDOW_MS) {
-    entry = { turnId: turn.turnId, progressAt: turn.lastProgressAt, firstAt: now, attempts: 0 }
-  }
-  entry.attempts++
-  noProgressRepeats.delete(convKey)
-  noProgressRepeats.set(convKey, entry)
-  while (noProgressRepeats.size > NO_PROGRESS_REPEAT_MAX_ENTRIES) {
-    noProgressRepeats.delete(noProgressRepeats.keys().next().value)
-  }
-  return entry.attempts
 }
 
 function staleTurnVerdict(proc, turn, now = Date.now()) {
@@ -4317,7 +4477,6 @@ async function keepDroppedTurn(proc, turn, opts) {
 }
 
 async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn closed") {
-  noProgressRepeats.delete(proc.convKey)
   turn.closeNote = note
   proc.retiring = true
   proc.historyInvalid = true
@@ -4334,48 +4493,44 @@ async function reclaimStaleTurn(proc, turn, note = "agy bridge: stale tool turn 
   } finally { clearTimeout(timer) }
 }
 
-// Recheck under the same lock and start at most one replacement turn.
-// Kinds: active (409), conflict/incomplete (400), replayed, fallthrough.
-// `ctx.attempts` set means the no-progress repeat limit was reached: a quiet
-// turn is then reclaimed even if it is not provably stale (never an attached one).
+// Recheck under the same lock and start at most one replacement turn for tool
+// results no live call waits for. Kinds: active (503: the held turn streams,
+// steers or was replaced meanwhile), incomplete (400), replayed, fallthrough.
+// A held turn that only waits is left behind at once: the request carries its
+// own whole tool round, and no later request answers that turn's calls (its
+// client has moved past them), so waiting on it would only return errors.
 async function recoverStaleTurn(ctx) {
   return withAcquireLock(ctx.convKey, async () => {
     const current = pool.get(ctx.proc?.convKey ?? ctx.convKey) // Parallel lanes (local patch): its own key
     const held = current?.turn
-    const forced = ctx.attempts != null
-    const extra = forced ? { attempts: ctx.attempts } : {}
-    const turnId = ctx.turn?.turnId ?? null
-    if (!current || !held) {
-      if (!forced) return { kind: "fallthrough" }
-      // Another request already disposed of this turn: this duplicate must not start a second one.
-      logBridgeEvent(current, ctx.turn, "recover_refused", "turn_gone", ctx.acquireOpts, extra)
-      return { kind: "conflict", turnId }
-    }
+    if (!current || !held || held.cancelRequested) return { kind: "fallthrough" }
     if (current !== ctx.proc || held !== ctx.turn) {
-      // Another request replaced the turn while this one waited: never cancel it.
-      logBridgeEvent(current, held, "recover_refused", "turn_replaced", ctx.acquireOpts, extra)
-      return { kind: "conflict", turnId }
+      // Another request replaced the turn while this one waited: never cancel
+      // it; the client tries again against what holds the session now.
+      logBridgeEvent(current, held, "recover_refused", "turn_replaced", ctx.acquireOpts)
+      return { kind: "active", reason: "replaced" }
     }
-    if (held.cancelRequested) return { kind: "fallthrough" }
     const verdict = movedOnVerdict(held, ctx.body?.messages) ?? staleTurnVerdict(current, held)
-    // Lineage supersession belongs to acquisition of a new prompt. Unmatched
-    // results alone reclaim an unexpired owner only at the repeat limit.
-    if (!verdict.stale && (!forced || verdict.reason === "attached" || verdict.reason === "steering")) {
-      logBridgeEvent(current, held, "reject_active", verdict.reason, ctx.acquireOpts, extra)
-      return { kind: "active" }
+    if (!verdict.stale && (verdict.reason === "attached" || verdict.reason === "steering")) {
+      logBridgeEvent(current, held, "reject_active", verdict.reason, ctx.acquireOpts)
+      return { kind: "active", reason: verdict.reason }
     }
-    const reason = verdict.stale ? verdict.reason : "no_progress_repeat"
-    logBridgeEvent(current, held, "reclaim", reason, ctx.acquireOpts, extra)
-    await reclaimStaleTurn(current, held)
     const problem = replayHistoryProblem(ctx.body, ctx.resultBlocks)
     if (problem) {
-      logBridgeEvent(current, held, "replay_refused", problem, ctx.acquireOpts, extra)
-      return { kind: "incomplete", turnId }
+      logBridgeEvent(current, held, "replay_refused", problem, ctx.acquireOpts)
+      return { kind: "incomplete" }
     }
+<<<<<<< HEAD
     const { proc, history } = await acquireProcLocked(ctx.agy, ctx.convKey,
       { ...ctx.acquireOpts, laneKey: current.convKey }, ctx.isFresh, true)
+=======
+    const reason = verdict.stale ? verdict.reason : "unmatched_results"
+    logBridgeEvent(current, held, "reclaim", reason, ctx.acquireOpts)
+    await reclaimStaleTurn(current, held)
+    const { proc, history } = await acquireProcLocked(ctx.agy, ctx.convKey, ctx.acquireOpts, ctx.isFresh, true)
+>>>>>>> upstream
     const turn = await ctx.begin(proc, history)
-    logBridgeEvent(proc, turn, "replay_started", reason, ctx.acquireOpts, { ...extra, replaced_turn_id: held.turnId })
+    logBridgeEvent(proc, turn, "replay_started", reason, ctx.acquireOpts, { replaced_turn_id: held.turnId })
     return { kind: "replayed", proc, turn }
   })
 }
@@ -4481,6 +4636,75 @@ function toolUseIdentitiesKey(messages) {
     }
   }
   return stableJSON(rows)
+}
+
+// The header billion-context starts each summary of a folded context
+// section with (its kernel's SUMMARY_HEADER; "— <topic>" may follow).
+const CLIENT_SUMMARY_HEADER = "[Compressed conversation section]"
+
+function clientSummaryTexts(message) {
+  const blocks = Array.isArray(message?.content) ? message.content : [{ type: "text", text: message?.content }]
+  const out = []
+  for (const block of blocks) {
+    const text = typeof block === "string" ? block : block?.type === "text" ? block.text : null
+    if (typeof text !== "string") continue
+    const at = text.startsWith(CLIENT_SUMMARY_HEADER) ? 0 : text.indexOf("\n" + CLIENT_SUMMARY_HEADER)
+    if (at >= 0) out.push(text.slice(at).trimStart())
+  }
+  return out
+}
+
+// `actual` is `expected` with earlier messages folded into a client summary
+// the live session has not seen: a summary `expected` lacks is there, and
+// every message after the last summary is the same as the end of
+// `expected`. An edit with no new summary is still a different history.
+function compactedEarlierHistory(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false
+  const seen = new Set(expected.flatMap(clientSummaryTexts))
+  let last = -1
+  let fresh = false
+  for (let i = 0; i < actual.length; i++) {
+    const texts = clientSummaryTexts(actual[i])
+    if (!texts.length) continue
+    last = i
+    if (texts.some((text) => !seen.has(text))) fresh = true
+  }
+  if (!fresh) return false
+  const tail = actual.slice(last + 1)
+  if (!tail.length || tail.length > expected.length) return false
+  const mine = expected.slice(expected.length - tail.length)
+  if (historyKey(mine) === historyKey(tail)) return true
+  return sameToolUseIdentities(mine, tail) &&
+    historyKey(stripToolUseInputs(mine)) === historyKey(stripToolUseInputs(tail))
+}
+
+// Whether actual is expected but for text that was there for one request
+// only: the text after the tool results of expected's newest user row, which
+// actual has cut short or not at all (the rest the same but for masking).
+// Something between the client and magpie added it to that request (a
+// proxy's nudge, a plugin's note): the client never stored it, so the next
+// request goes on without it. agy saw it once, as the request had it. Only
+// that row: a user's own text, or text in any earlier row, that changed is
+// still a changed history. A row's text is never forgiven for growing.
+function droppedOneRequestText(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return false
+  const a = historyRows(expected)
+  const b = historyRows(actual)
+  if (a.length !== b.length) return false
+  let row = a.length - 1
+  while (row >= 0 && a[row].role !== "user") row--
+  if (row < 0 || b[row].role !== "user") return false
+  const mine = a[row].content
+  const theirs = b[row].content
+  const lastResult = mine.findLastIndex((block) => block.type === "tool_result")
+  // text alone after the row's last tool result, merged into one block
+  if (lastResult < 0 || lastResult !== mine.length - 2 || mine.at(-1).type !== "text") return false
+  const kept = theirs.length === mine.length && theirs.at(-1).type === "text" ? theirs.at(-1).text : null
+  if (kept == null && theirs.length !== mine.length - 1) return false
+  if (kept != null && (kept === mine.at(-1).text || !mine.at(-1).text.startsWith(kept))) return false
+  const cut = a.map((item, index) => index !== row ? item
+    : { ...item, content: kept == null ? mine.slice(0, -1) : [...mine.slice(0, -1), { ...mine.at(-1), text: kept }] })
+  return sameUpToMasking(cut, b)
 }
 
 function sameToolUseIdentities(left, right) {
@@ -4798,6 +5022,65 @@ function isContinuedOpening(proc, firstMessage) {
   return flattenedContinuationMessage(proc, firstMessage) != null
 }
 
+// The live session of a conversation whose first message masking now writes
+// otherwise (a value in it went as written before and as a placeholder now,
+// or back), so its key changed though the conversation is the same one
+// (yetone/magpie#7223).
+function findRemaskedProc(convKey, opts) {
+  const first = Array.isArray(opts?.messages) ? opts.messages[0] : null
+  const history = opts?.history
+  const account = /^(.*?)[0-9a-f]{64}$/.exec(convKey)?.[1]
+  if (!first || !Array.isArray(history) || !history.length || account == null) return null
+  let found = null
+  for (const proc of pool.values()) {
+    if (proc.dead || proc.retiring || proc.turn || !proc.hasSentFirstTurn) continue
+    if (proc.convKey === convKey || /^(.*?)[0-9a-f]{64}$/.exec(proc.convKey)?.[1] !== account) continue
+    if ((proc.userId || "") !== (opts.userId || "")) continue
+    if ((proc.sessionScope || "") !== (opts.sessionScope || "")) continue
+    if (proc.workDir !== opts.workDir || !sameInstructions(proc.instructions, opts.instructions)) continue
+    const expectedFirst = Array.isArray(proc.expectedMessages) ? proc.expectedMessages[0] : null
+    // the same first message but for masking: each place they differ a
+    // value and its placeholder, or a key and a made-up key of its form
+    if (!expectedFirst || !sameHistoryUpToMasking([expectedFirst], [first])) continue
+    if (!proc.matchesHistory(history)) continue
+    // two would be a guess
+    if (found) return null
+    found = proc
+  }
+  return found
+}
+
+// A request that needs nothing of agy's but one answer: no stream to hold,
+// no tools, no tool results and no earlier turns (an image described, a
+// title written). Any agy of the same launch can open a session for it.
+function statelessRequest(opts) {
+  return !!opts && opts.nonstream === true && !opts.tools?.length && !opts.hasToolResults &&
+    Array.isArray(opts.history) && !opts.history.length
+}
+
+// An idle agy whose only turn answered a stateless request, for another
+// stateless request to open its session in (Proc.reuse); the longest idle
+// first. Only one whose session holds that single turn: an agy a
+// conversation went on in is never taken.
+function findStatelessDonor(opts, launch) {
+  if (!statelessRequest(opts) || !launch || process.env.AGY_BRIDGE_STATELESS_REUSE === "0") return null
+  const userId = opts.userId || ""
+  const sessionScope = opts.sessionScope || ""
+  let best = null
+  for (const proc of pool.values()) {
+    if (!statelessDonor(proc, launch, userId, sessionScope, opts.workDir)) continue
+    if (!best || proc.lastUsed < best.lastUsed) best = proc
+  }
+  return best
+}
+
+function statelessDonor(proc, launch, userId, sessionScope, workDir) {
+  return !!proc && proc.stateless && !proc.dead && !proc.stopping && !proc.retiring && !proc.turn &&
+    !proc.resumed && proc.hasSentFirstTurn && proc.sessionPrompts === 1 && !!proc.sessionId &&
+    proc.launchKey === launch && (proc.userId || "") === userId &&
+    (proc.sessionScope || "") === sessionScope && proc.workDir === workDir
+}
+
 function findLiveContinuedProc(opts) {
   const first = Array.isArray(opts?.messages) ? opts.messages[0] : null
   if (!first) return null
@@ -4837,43 +5120,305 @@ function rekeyProc(proc, newKey) {
 }
 
 
-function historyKey(messages) {
+// magpie's masking writes {{KIND_xxxxxxxx}} in place of a value it found
+// (redact.tag: the kind, then 8 lowercase base32 of a keyed hash). The
+// model can write one back mangled (spaces in the braces, braces gone, its
+// case changed), and magpie restores those too (redact.Restore), so each
+// counts as a placeholder here.
+const PLACEHOLDER_SOURCE = String.raw`\{\{\s*[A-Za-z][A-Za-z0-9_]*_[A-Za-z2-7]{8}\s*\}\}|(?<![\p{L}\p{N}_])[A-Z][A-Z0-9]*(?:_[A-Z0-9]+)*_[a-z2-7]{8}(?![\p{L}\p{N}_])`
+const PLACEHOLDER_RE = new RegExp(`^(?:${PLACEHOLDER_SOURCE})$`, "u")
+// A token is a placeholder, a word (with the '.' and '-' inside it, so a
+// key is one token with its head), a run of space, or one other character.
+const MASK_TOKEN_RE = new RegExp(`${PLACEHOLDER_SOURCE}|[\\p{L}\\p{N}_](?:[\\p{L}\\p{N}_.-]*[\\p{L}\\p{N}_])?|\\s+|[^]`, "gu")
+// The longest text one placeholder stands in for, in characters.
+const MASKED_VALUE_MAX = 1024
+// The most token edits one text's comparison looks through.
+const MASK_DIFF_MAX_EDITS = 256
+
+// Two texts are the same but for masking when every place they differ has
+// placeholders alone on one side: a value one request sent as written went
+// masked on the other (#7223, 0.1.100), a value went under another
+// placeholder (a kind the local model found late, a span it drew wider),
+// or the model wrote a placeholder back mangled. A hunk without a
+// placeholder on either side is a real edit.
+function sameTextUpToMasking(a, b) {
+  if (a === b) return true
+  // with no placeholder in either, only made-up keys can differ, and they
+  // keep the length
+  if (!PLACEHOLDER_IN_TEXT_RE.test(a) && !PLACEHOLDER_IN_TEXT_RE.test(b) && a.length !== b.length) return false
+  const hunks = tokenHunks(a.match(MASK_TOKEN_RE) || [], b.match(MASK_TOKEN_RE) || [], MASK_DIFF_MAX_EDITS)
+  return hunks != null && hunks.every(({ removed, added }) =>
+    maskingHunk(removed, added) || maskingHunk(added, removed) || shapedKeyHunk(removed.join(""), added.join("")))
+}
+
+// magpie can send a key as a made-up key of its own form (redact's shape.go:
+// sk_w3axCByTQgK1Px… as sk_hYQWRBFmdHNI…): the same head, length and
+// separators, and the same kind of character in each place, with six or
+// more made up. Only a key with a head (sk-, ghp_, xoxb-, AKIA) is shaped,
+// so a hash or an id without one that changed is still a real edit.
+function shapedKeyHunk(a, b) {
+  if (a.length !== b.length || a.length < 8 || !/^[A-Za-z0-9_.-]+$/.test(a) || !/^[A-Za-z0-9_.-]+$/.test(b)) return false
+  const head = shapedKeyHead(a)
+  if (!head || head !== shapedKeyHead(b)) return false
+  let made = 0
+  for (let index = 0; index < a.length; index++) {
+    if (charKind(a[index]) !== charKind(b[index])) return false
+    if (a[index] !== b[index]) made++
+  }
+  return made >= 6
+}
+
+function charKind(ch) {
+  return /[a-z]/.test(ch) ? "a" : /[A-Z]/.test(ch) ? "A" : /[0-9]/.test(ch) ? "0" : ch
+}
+
+// redact's keyHead
+const SHAPED_KEY_PREFIXES = ["sk-ant-api03-", "sk-ant-oat01-", "sk-ant-admin01-", "sk-proj-", "sk-svcacct-", "sk-or-v1-", "github_pat_"]
+function shapedKeyHead(value) {
+  const prefix = SHAPED_KEY_PREFIXES.find((head) => value.startsWith(head))
+  if (prefix) return prefix
+  if (value.startsWith("AKIA") || value.startsWith("ASIA")) return value.slice(0, 4)
+  return /^[A-Za-z]{1,4}[-_]/.exec(value)?.[0] || ""
+}
+
+const PLACEHOLDER_IN_TEXT_RE = new RegExp(PLACEHOLDER_SOURCE, "u")
+
+const PLACEHOLDERS_IN_TEXT_RE = new RegExp(PLACEHOLDER_SOURCE, "gu")
+
+// placeholders (and the space between them) on one side, a value of a
+// value's length on the other. The text around the placeholders, when they
+// are glued to a word (张三的电话 as {{PERSON_x}}的电话, alice-project as
+// {{USER_x}}-project), is the same on both sides, character for character,
+// so a word changed beside a placeholder is still a real edit
+// (yetone/magpie#7223).
+function maskingHunk(placeholders, value) {
+  if (!placeholders.length || !value.length) return false
+  const masked = placeholders.join("")
+  const written = value.join("")
+  const found = [...masked.matchAll(PLACEHOLDERS_IN_TEXT_RE)]
+  if (!found.length) return false
+  const start = found[0].index
+  const end = found.at(-1).index + found.at(-1)[0].length
+  // only placeholders and the space between them in the middle
+  if (masked.slice(start, end).replace(PLACEHOLDERS_IN_TEXT_RE, "").trim()) return false
+  // space alone around them is not text of the value's (as before)
+  const before = masked.slice(0, start).trim() ? masked.slice(0, start) : ""
+  const after = masked.slice(end).trim() ? masked.slice(end) : ""
+  if (written.length <= before.length + after.length || !written.startsWith(before) || !written.endsWith(after)) return false
+  return written.length - before.length - after.length <= MASKED_VALUE_MAX
+}
+
+// The places two token lists differ, each as the tokens one has there and
+// the other has there (Myers' diff), or null past maxEdits.
+function tokenHunks(a, b, maxEdits) {
+  let start = 0
+  while (start < a.length && start < b.length && a[start] === b[start]) start++
+  let endA = a.length
+  let endB = b.length
+  while (endA > start && endB > start && a[endA - 1] === b[endB - 1]) {
+    endA--
+    endB--
+  }
+  const x0 = a.slice(start, endA)
+  const y0 = b.slice(start, endB)
+  const n = x0.length
+  const m = y0.length
+  if (!n && !m) return []
+  const offset = maxEdits + 1
+  const v = new Int32Array(2 * maxEdits + 3).fill(-1)
+  v[offset + 1] = 0
+  const trace = []
+  let found = -1
+  for (let d = 0; d <= maxEdits && found < 0; d++) {
+    trace.push(v.slice())
+    for (let k = -d; k <= d; k += 2) {
+      let x = k === -d || (k !== d && v[offset + k - 1] < v[offset + k + 1]) ? v[offset + k + 1] : v[offset + k - 1] + 1
+      let y = x - k
+      while (x < n && y < m && x0[x] === y0[y]) {
+        x++
+        y++
+      }
+      v[offset + k] = x
+      if (x >= n && y >= m) {
+        found = d
+        break
+      }
+    }
+  }
+  if (found < 0) return null
+  // walk back from the end: each step is a token kept, removed or added
+  const ops = []
+  let x = n
+  let y = m
+  for (let d = found; d > 0; d--) {
+    const prev = trace[d]
+    const k = x - y
+    const prevK = k === -d || (k !== d && prev[offset + k - 1] < prev[offset + k + 1]) ? k + 1 : k - 1
+    const prevX = prev[offset + prevK]
+    const prevY = prevX - prevK
+    while (x > prevX && y > prevY) {
+      ops.push(0)
+      x--
+      y--
+    }
+    ops.push(x === prevX ? 1 : -1)
+    x = prevX
+    y = prevY
+  }
+  ops.reverse()
+  const hunks = []
+  let i = 0
+  let j = 0
+  let hunk = null
+  for (const op of [...new Array(x).fill(0), ...ops]) {
+    if (op === 0) {
+      hunk = null
+      i++
+      j++
+      continue
+    }
+    if (!hunk) {
+      hunk = { removed: [], added: [] }
+      hunks.push(hunk)
+    }
+    if (op < 0) hunk.removed.push(x0[i++])
+    else hunk.added.push(y0[j++])
+  }
+  return hunks
+}
+
+// Whether two values of the history key are the same but for masking: the
+// same shape, the same keys, numbers and flags, and every string the same
+// or the same but for masking (sameTextUpToMasking).
+function sameUpToMasking(a, b) {
+  if (a === b) return true
+  if (typeof a === "string" || typeof b === "string") {
+    return typeof a === "string" && typeof b === "string" && sameTextUpToMasking(a, b)
+  }
+  if (Array.isArray(a) || Array.isArray(b)) {
+    return Array.isArray(a) && Array.isArray(b) && a.length === b.length && a.every((item, index) => sameUpToMasking(item, b[index]))
+  }
+  if (!a || !b || typeof a !== "object" || typeof b !== "object") return false
+  const keysA = Object.keys(a).filter((key) => a[key] !== undefined).sort()
+  const keysB = Object.keys(b).filter((key) => b[key] !== undefined).sort()
+  return keysA.length === keysB.length && keysA.every((key, index) => key === keysB[index] && sameUpToMasking(a[key], b[key]))
+}
+
+// Where two histories first differ, as the key reads them (historyRows:
+// a run of one role's messages is one row, its texts joined), with no text
+// of either: the row's index (and from the end), the block, what differs in
+// it, and whether it differs only by masking; rows is how many rows the
+// longer has. For the drop_live and session_new logs (yetone/magpie#7223).
+function firstHistoryDiff(expected, actual) {
+  if (!Array.isArray(expected) || !Array.isArray(actual)) return null
+  const keyed = (messages) => historyRows(messages).map((row) => ({ role: row.role, blocks: row.content }))
+  const a = keyed(expected)
+  const b = keyed(actual)
+  // the first difference masking doesn't explain, else the first
+  let differing = 0
+  let maskedOnly = 0
+  let first = null
+  let firstMasked = null
+  for (let index = 0; index < Math.max(a.length, b.length); index++) {
+    const where = messageDiff(a[index], b[index])
+    if (!where) continue
+    const at = { index, from_end: Math.max(a.length, b.length) - 1 - index, ...where }
+    if (where.masked) {
+      maskedOnly++
+      firstMasked ??= at
+    } else {
+      differing++
+      first ??= at
+    }
+  }
+  const out = first ?? firstMasked
+  return out && { ...out, rows: Math.max(a.length, b.length), differing_messages: differing, masked_messages: maskedOnly }
+}
+
+function messageDiff(a, b) {
+  if (!a || !b) return { field: a ? "missing_actual" : "missing_expected", masked: false }
+  if (a.role !== b.role) return { field: "role", masked: false }
+  if (stableJSON(a.blocks) === stableJSON(b.blocks)) return null
+  const masked = sameUpToMasking(a.blocks, b.blocks)
+  if (a.blocks.length !== b.blocks.length) {
+    return { role: a.role, field: "block_count", expected_blocks: a.blocks.length, actual_blocks: b.blocks.length, masked }
+  }
+  for (let block = 0; block < a.blocks.length; block++) {
+    const x = a.blocks[block]
+    const y = b.blocks[block]
+    if (stableJSON(x) === stableJSON(y)) continue
+    const out = { role: a.role, block, block_type: x.type, masked }
+    if (x.type !== y.type) return { ...out, field: "type", actual_type: y.type }
+    const keys = [...new Set([...Object.keys(x), ...Object.keys(y)])].sort()
+    const field = keys.find((key) => stableJSON(x[key]) !== stableJSON(y[key])) || "block"
+    out.field = field
+    const left = typeof x[field] === "string" ? x[field] : stableJSON(x[field]) ?? ""
+    const right = typeof y[field] === "string" ? y[field] : stableJSON(y[field]) ?? ""
+    let offset = 0
+    while (offset < left.length && offset < right.length && left[offset] === right[offset]) offset++
+    out.offset = offset
+    out.expected_len = left.length
+    out.actual_len = right.length
+    out.placeholders = PLACEHOLDER_IN_TEXT_RE.test(left) || PLACEHOLDER_IN_TEXT_RE.test(right)
+    return out
+  }
+  return { role: a.role, field: "block", masked }
+}
+
+// Whether two histories are the same but for masking, as the key reads
+// them.
+function sameHistoryUpToMasking(expected, actual) {
+  return sameUpToMasking(historyRows(expected), historyRows(actual))
+}
+
+// One block as the history key reads it, or null for a block the key
+// leaves out (thinking, tool catalog changes). ids numbers tool calls in
+// order, so a client's ids of its own key the same.
+function historyBlock(block, ids) {
+  if (!block) return null
+  if (block.type === "thinking" || block.type === "redacted_thinking" ||
+    block.type === "tool_addition" || block.type === "tool_removal") return null
+  let value
+  if (typeof block === "string" || block.type === "text") {
+    value = { type: "text", text: stripVolatileOpening(stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "")) }
+  } else if (block.type === "document") {
+    value = { type: "text", text: parseUserDocumentText(block) }
+  } else if (block.type === "search_result") {
+    value = { type: "text", text: parseSearchResultText(block) }
+  } else if (block.type === "image") {
+    const image = parseUserImage(block)
+    value = { type: "image", mimeType: image.mimeType, sha256: digest(image.data) }
+  } else if (block.type === "tool_use") {
+    const ordinal = ids.size + 1
+    ids.set(block.id, ordinal)
+    value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
+  } else if (block.type === "tool_result") {
+    const result = toolResult(block)
+    // An image a tool returned is keyed by its hash, as a user's image
+    // is, not copied whole into the key on every round-trip (plugins#1137).
+    const content = result.content.map((part) => part.type === "image"
+      ? { type: "image", mimeType: part.mimeType, sha256: digest(part.data) }
+      : part)
+    value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...result, content }
+  } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
+    block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
+    value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
+  } else {
+    value = block
+  }
+  return value
+}
+
+// The history as the key reads it: one row for each run of messages of one
+// role, its texts joined and trimmed.
+function historyRows(messages) {
   const rows = []
   const ids = new Map()
   for (const message of messages) {
     const blocks = Array.isArray(message.content) ? message.content : [{ type: "text", text: message.content ?? "" }]
     for (const block of blocks) {
-      if (!block) continue
-      if (block.type === "thinking" || block.type === "redacted_thinking" ||
-        block.type === "tool_addition" || block.type === "tool_removal") continue
-      let value
-      if (typeof block === "string" || block.type === "text") {
-        value = { type: "text", text: stripVolatileOpening(stripMagpiePlaceholderNotice(typeof block === "string" ? block : block.text || "")) }
-      } else if (block.type === "document") {
-        value = { type: "text", text: parseUserDocumentText(block) }
-      } else if (block.type === "search_result") {
-        value = { type: "text", text: parseSearchResultText(block) }
-      } else if (block.type === "image") {
-        const image = parseUserImage(block)
-        value = { type: "image", mimeType: image.mimeType, sha256: digest(image.data) }
-      } else if (block.type === "tool_use") {
-        const ordinal = ids.size + 1
-        ids.set(block.id, ordinal)
-        value = { type: "tool_use", id: ordinal, name: block.name, input: block.input ?? {} }
-      } else if (block.type === "tool_result") {
-        const result = toolResult(block)
-        // An image a tool returned is keyed by its hash, as a user's image
-        // is, not copied whole into the key on every round-trip (plugins#1137).
-        const content = result.content.map((part) => part.type === "image"
-          ? { type: "image", mimeType: part.mimeType, sha256: digest(part.data) }
-          : part)
-        value = { type: "tool_result", id: ids.get(block.tool_use_id) ?? block.tool_use_id, ...result, content }
-      } else if (block.type === "server_tool_use" || block.type === "mcp_tool_use" ||
-        block.type === "container_upload" || SERVER_TOOL_RESULT_BLOCK_TYPES.has(block.type)) {
-        value = { type: block.type, name: block.name || "", content: renderServerAssistantBlock(block) }
-      } else {
-        value = block
-      }
+      const value = historyBlock(block, ids)
+      if (!value) continue
       let row = rows.at(-1)
       if (!row || row.role !== message.role) {
         row = { role: message.role, content: [] }
@@ -4887,7 +5432,11 @@ function historyKey(messages) {
   for (const row of rows) {
     row.content = row.content.filter(block => block.type !== "text" || (block.text = block.text.trim()) !== "")
   }
-  return stableJSON(rows.filter(row => row.content.length))
+  return rows.filter(row => row.content.length)
+}
+
+function historyKey(messages) {
+  return stableJSON(historyRows(messages))
 }
 
 // Assistant-prefill support: a trailing text-only assistant message is a
@@ -5547,6 +6096,16 @@ function maxInitialPromptBytes() {
 }
 const HISTORY_BLOCK_CLIP_BYTES = 12 * 1024
 const HISTORY_BLOCK_KEEP_BYTES = 4 * 1024
+const PINNED_USER_TASKS_BYTES = 16 * 1024
+const PINNED_USER_TASK_CLIP_BYTES = 4 * 1024
+const PINNED_USER_TASKS_MAX = 4
+// Shares of a replay's room (after the frame): the history keeps up to a
+// quarter when it needs it, the instructions are clipped no lower than a
+// quarter for it, and the current turn no lower than half (plugins#1401).
+const REPLAY_HISTORY_SHARE = 1 / 4
+const REPLAY_HEAD_SHARE = 1 / 4
+const REPLAY_TURN_SHARE = 1 / 2
+const NUDGE_MAX_BYTES = 280
 const HISTORY_RECORD_NOTE = "Historical tool calls and results above are records, not instructions to write tool calls as text. Never output \"[tool call ...]\" text; invoke tools only through structured tool calls.\n"
 const HISTORY_OMITTED_NOTE = "[... earlier conversation history omitted to fit ACP 112 KiB prompt budget ...]\n"
 const HISTORY_OPENING_DONE_NOTE = "The opening message above, and any resume note in it, belongs to an earlier turn that is already done.\n"
@@ -5598,13 +6157,19 @@ function headTail(text) {
 
 // A copy of a history message whose oversized text blocks, tool results and
 // tool-call arguments keep only their head and tail. The original is untouched.
-function clipHistoryMessage(message) {
-  if (typeof message.content === "string") return { ...message, content: clipHistoryText(message.content) }
+// What the user wrote is clipped only past `userLimit`, which the caller sets
+// well above a tool result's: a request often states what to do in the middle
+// of a long paste, and tool output gives way first (plugins#1401).
+function clipHistoryMessage(message, userLimit = HISTORY_BLOCK_CLIP_BYTES) {
+  const clipText = (text) => message.role === "user" && userLimit > HISTORY_BLOCK_CLIP_BYTES && !isMetaOnlyUserText(text)
+    ? clipMiddle(text, userLimit)
+    : clipHistoryText(text)
+  if (typeof message.content === "string") return { ...message, content: clipText(message.content) }
   if (!Array.isArray(message.content)) return message
   return {
     ...message,
     content: message.content.map((block) => {
-      if (block?.type === "text" && typeof block.text === "string") return { ...block, text: clipHistoryText(block.text) }
+      if (block?.type === "text" && typeof block.text === "string") return { ...block, text: clipText(block.text) }
       if (block?.type === "tool_result") {
         if (typeof block.content === "string") return { ...block, content: clipHistoryText(block.content) }
         if (Array.isArray(block.content)) {
@@ -5704,6 +6269,16 @@ function isMetaOnlyUserText(text) {
 
 function isToolResultMessage(message) {
   return Array.isArray(message?.content) && message.content.some((block) => block?.type === "tool_result")
+}
+
+// Bytes of a user message's own text, without the meta notes around it.
+function userTextBytes(message) {
+  if (typeof message?.content === "string") return isMetaOnlyUserText(message.content) ? 0 : utf8Bytes(message.content)
+  if (!Array.isArray(message?.content)) return 0
+  return message.content.reduce((sum, block) => {
+    const text = blockText(block)
+    return sum + (text && !isMetaOnlyUserText(text) ? utf8Bytes(text) : 0)
+  }, 0)
 }
 
 // A user message with no tool result and something the user wrote or attached.
@@ -5815,6 +6390,36 @@ function fillHistoryTail(entries, floor, left, noteBytes) {
 
 // `reserveBytes` is text the caller appends after </current_turn>.
 function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, reserveBytes = 0) {
+  return renderInitialPrompt(body, callerWorkDir, instructionsInSession, reserveBytes).parts
+}
+
+// The newest user tasks a replay reports on, newest first.
+const REPLAY_STATS_LAST_USER = 4
+
+// Counts only, never content: how much of the history a replay kept, and
+// whether each of the newest user tasks went in whole, clipped or not at all.
+function replayStats(history, raw, kept, keptIndices) {
+  const sum = (list) => list.reduce((total, entry) => total + entry.bytes, 0)
+  const keptAt = new Map(keptIndices.map((index, at) => [index, kept[at]]))
+  const users = []
+  for (let i = history.length - 1; i >= 0 && users.length < REPLAY_STATS_LAST_USER; i--) {
+    if (isUserTask(history[i])) users.push(i)
+  }
+  return {
+    messages_before: history.length,
+    messages_after: keptIndices.length,
+    user_before: history.filter(isUserTask).length,
+    user_after: keptIndices.filter((i) => isUserTask(history[i])).length,
+    bytes_before: sum(raw),
+    bytes_after: sum([...keptAt.values()]),
+    clipped: keptIndices.filter((i) => keptAt.get(i).bytes < raw[i].bytes).length,
+    last_user_index: users,
+    last_user_kept: users.map((i) => keptAt.has(i)),
+    last_user_whole: users.map((i) => keptAt.has(i) && keptAt.get(i).bytes >= raw[i].bytes),
+  }
+}
+
+function renderInitialPrompt(body, callerWorkDir, instructionsInSession, reserveBytes = 0) {
   const { history, messages: current } = trailingMessages(body)
   const budget = Math.max(0, maxInitialPromptBytes() - reserveBytes)
   const head = []
@@ -5825,7 +6430,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
   }
   const currentParts = renderTurnMessagesParts(current)
   // A fresh conversation needs no wrapper; it would only add tokens.
-  if (!head.length && !history.length) return clipPartsToBytes(currentParts, budget)
+  if (!head.length && !history.length) return { parts: clipPartsToBytes(currentParts, budget), stats: replayStats(history, [], [], []) }
   const historyOpen = history.length ? "<conversation_history>\n" : ""
   const historyClose = history.length ? HISTORY_RECORD_NOTE + "</conversation_history>\n\n" : ""
   const turnOpen = "<current_turn>\n"
@@ -5841,16 +6446,37 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
     turn = clipPartsToBytes(turn, Math.max(forTurn, Math.min(promptTextBytes(turn), Math.floor((budget - frame) / 2))))
     headParts = clipPartsToBytes(headParts, Math.max(0, budget - frame - promptTextBytes(turn)))
   }
-  let room = budget - frame - promptTextBytes(headParts) - promptTextBytes(turn)
   const render = (message) => {
     const parts = renderHistoryEntry(message)
     return { parts, bytes: promptTextBytes(parts) }
   }
+  const raw = history.map(render)
+  // The conversation so far keeps a share of the prompt: a client's system
+  // prompt of ~100 KB left a 500 KB history 10 KB, and the model, with none
+  // of what it had done, read and checked the same things again
+  // (plugins#1401). Instructions give way first, then the current turn, each
+  // down to its own share.
+  const available = Math.max(0, budget - frame)
+  const historyWant = Math.min(raw.reduce((sum, entry) => sum + entry.bytes, 0),
+    Math.floor(available * REPLAY_HISTORY_SHARE))
+  let short = promptTextBytes(headParts) + promptTextBytes(turn) + historyWant - available
+  if (short > 0 && promptTextBytes(headParts) > Math.floor(available * REPLAY_HEAD_SHARE)) {
+    const limit = Math.max(Math.floor(available * REPLAY_HEAD_SHARE), promptTextBytes(headParts) - short)
+    headParts = clipPartsToBytes(headParts, limit)
+    short = promptTextBytes(headParts) + promptTextBytes(turn) + historyWant - available
+  }
+  if (short > 0 && promptTextBytes(turn) > Math.floor(available * REPLAY_TURN_SHARE)) {
+    turn = clipPartsToBytes(turn, Math.max(Math.floor(available * REPLAY_TURN_SHARE), promptTextBytes(turn) - short))
+  }
+  let room = budget - frame - promptTextBytes(headParts) - promptTextBytes(turn)
   const overRoom = (list) => list.reduce((sum, entry) => sum + entry.bytes, 0) > room
   // A replay that fits is sent whole; only one that does not has its big
   // blocks clipped first (#1055).
-  let entries = history.map(render)
-  if (overRoom(entries)) entries = history.map((message) => render(clipHistoryMessage(message)))
+  let entries = raw
+  let keptIndices = entries.map((_, i) => i)
+  if (overRoom(entries)) {
+    entries = history.map((message) => render(clipHistoryMessage(message, Math.max(HISTORY_BLOCK_CLIP_BYTES, Math.floor(room / 3)))))
+  }
   let kept = entries
   let showOpeningDone = false
   if (overRoom(entries)) {
@@ -5861,6 +6487,7 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
     let reservedOpeningDone = false
     if (room < noteBytes) {
       kept = []
+      keptIndices = []
     } else {
       if (inToolLoop && loopStart > 0 && room >= noteBytes + openingDoneBytes) {
         reservedOpeningDone = true
@@ -5889,7 +6516,28 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
           }
         }
       }
-      let left = room - keptSliceBytes(keep, entries.length, entries, noteBytes)
+      // A short follow-up ("快点", "继续") as the newest request carries no
+      // task of its own; it points back at one an earlier turn asked for.
+      // Room for the newest earlier user messages is set aside before the
+      // tail fills, and they go in after it (plugins#1401).
+      const newestTask = inToolLoop ? latestLoopTaskRun(history, loopStart) : null
+      const newestBytes = inToolLoop
+        ? (newestTask ? newestTask.tasks.reduce((sum, i) => sum + userTextBytes(history[i]), 0) : -1)
+        : current.reduce((sum, message) => sum + (isUserTask(message) ? userTextBytes(message) : 0), 0) ||
+          -1
+      // The newest earlier task is what the nudge most likely means: room is
+      // set aside for it whole (up to a third of the room), and for a few
+      // older ones clipped (plugins#1401).
+      let pinTarget = -1
+      for (let i = entries.length - 1; i > 0 && pinTarget < 0; i--) {
+        if (!keep.includes(i) && isUserTask(history[i])) pinTarget = i
+      }
+      const pinFirstBytes = Math.max(PINNED_USER_TASK_CLIP_BYTES, pinTarget > 0 ? entries[pinTarget].bytes : 0)
+      const pinReserve = newestBytes >= 0 && newestBytes <= NUDGE_MAX_BYTES
+        ? Math.min(PINNED_USER_TASKS_BYTES - PINNED_USER_TASK_CLIP_BYTES + pinFirstBytes,
+          Math.floor(room / (pinFirstBytes > PINNED_USER_TASK_CLIP_BYTES ? 3 : 4)))
+        : 0
+      let left = room - keptSliceBytes(keep, entries.length, entries, noteBytes) - pinReserve
       const floor = keep.length ? keep.at(-1) : -1
       let { tail, left: remainingLeft } = fillHistoryTail(entries, floor, left, noteBytes)
       const lastIdx = entries.length - 1
@@ -5912,7 +6560,40 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
           }
         }
       }
-      const keptIndices = [...keep, ...tail]
+      if (pinReserve) {
+        let pinned = 0
+        let pinnedBytes = 0
+        for (let idx = (tail.length ? tail[0] : entries.length) - 1; idx > 0 && pinned < PINNED_USER_TASKS_MAX; idx--) {
+          if (keep.includes(idx) || !isUserTask(history[idx])) continue
+          const saved = entries[idx]
+          // the first (newest) pin may take what the reserve has left; older ones are clipped
+          const limit = pinned ? PINNED_USER_TASK_CLIP_BYTES : Math.max(PINNED_USER_TASK_CLIP_BYTES, pinReserve - pinnedBytes)
+          if (saved.bytes > limit) entries[idx] = clipHistoryEntry(saved, limit)
+          const nextKeep = [...keep, idx].sort((x, y) => x - y)
+          if (pinnedBytes + entries[idx].bytes <= pinReserve &&
+            keptSliceBytes([...nextKeep, ...tail], entries.length, entries, noteBytes) <= room) {
+            keep = nextKeep
+            pinned++
+            pinnedBytes += entries[idx].bytes
+          } else {
+            entries[idx] = saved
+          }
+        }
+      }
+      // Mid tool loop the tail stops at the task that opened the loop, so the
+      // turns before it got only their user tasks: a 500 KB history kept 10 KB,
+      // and the model, with nothing of what it had just read or done, read
+      // and checked it all again (plugins#1401). They get the room left over,
+      // newest first.
+      if (inToolLoop && floor > 0) {
+        for (let idx = floor - 1; idx > 0; idx--) {
+          if (keep.includes(idx)) continue
+          const nextKeep = [...keep, idx].sort((x, y) => x - y)
+          if (keptSliceBytes([...nextKeep, ...tail], entries.length, entries, noteBytes) > room) break
+          keep = nextKeep
+        }
+      }
+      keptIndices = [...keep, ...tail]
       kept = []
       let next = 0
       for (const i of keptIndices) {
@@ -5936,7 +6617,14 @@ function renderInitialPromptParts(body, callerWorkDir, instructionsInSession, re
   appendPrompt(out, turnOpen)
   appendPrompt(out, turn)
   appendPrompt(out, turnClose)
-  return promptTextBytes(out) <= budget ? out : clipPartsToBytes(out, budget)
+  const stats = {
+    ...replayStats(history, raw, keptIndices.map((i) => entries[i]), keptIndices),
+    head_bytes: promptTextBytes(headParts),
+    head_clipped: promptTextBytes(headParts) < promptTextBytes(head),
+    turn_bytes: promptTextBytes(turn),
+    turn_clipped: promptTextBytes(turn) < promptTextBytes(currentParts),
+  }
+  return { parts: promptTextBytes(out) <= budget ? out : clipPartsToBytes(out, budget), stats }
 }
 
 function renderContinuedTurnParts(messages) {
@@ -6314,11 +7002,20 @@ function namedWorkDirectory(body, init) {
   const pattern = /(?:Primary working directory|^\s*(?:-\s*)?Working directory|Current working directory): *([^\r\n]+)$|<cwd>([^<\r\n]+)<\/cwd>/gm
   for (const text of texts) {
     for (const match of text.matchAll(pattern)) {
-      const value = (match[1] || match[2]).trim().replace(/^[`'"]+|[`'"]+$/g, "")
+      const value = unquotedDirectory((match[1] || match[2]).trim())
       if (value) directory = value
     }
   }
   return directory
+}
+
+// A directory as a prompt names it: bare, or quoted and ending a sentence
+// (DSH: Current working directory: "/path/to/dir".), where the closing
+// quote is followed by the sentence's mark (yetone/magpie#7223).
+function unquotedDirectory(value) {
+  const quoted = /^([`'"])(.*)\1[.,;:]?$/.exec(value)
+  if (quoted) return quoted[2].trim()
+  return value.replace(/^[`'"]+|[`'"]+$/g, "")
 }
 
 function workDirectory(directory) {
@@ -6613,9 +7310,17 @@ async function measuredUsage(turn, step, content, result) {
       if (final) turn.stepUsageReconciled = true
       step.usageKind = "agy_same_generation"
       step.modelCalls = 0
+      // No model call ran for this response, so it adds no input or output.
+      // Its prompt is still the shared generation's whole window: clients
+      // read a response's input + cache read + cache write as how full the
+      // context is (dsh's context meter, Claude Code's), and an all-zero
+      // prompt showed an empty context between two real ones (0% -> 10% ->
+      // 1%, @seven_7cx on X). The window goes as read from the cache, which
+      // is what asking the model again would have read.
+      const context = measured.context || 0
       return {
         input_tokens: 0,
-        cache_read_input_tokens: 0,
+        cache_read_input_tokens: context,
         cache_creation_input_tokens: 0,
         output_tokens: 0,
       }
@@ -6632,7 +7337,7 @@ async function measuredUsage(turn, step, content, result) {
   const output = steps.reduce((sum, item) => sum + Math.max(item.output, item.thinking), 0)
   const thinking = steps.reduce((sum, item) => sum + item.thinking, 0)
   turn.stepCursor = { source: batch.source, idx: last.idx }
-  turn.measured = { prompt }
+  turn.measured = { prompt, context: last.input + last.read + last.write }
   if (final) turn.stepUsageReconciled = true
   step.usageKind = "agy_model_call"
   step.modelCalls = steps.length
@@ -7148,12 +7853,20 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
   const flattened = proc.pendingFlattenedTurn
   proc.pendingFlattenedTurn = null
   const isFirstTurn = !proc.hasSentFirstTurn
-  const baseParts = !isFirstTurn
-    ? renderContinuedTurnParts(flattened
+  let baseParts
+  if (!isFirstTurn) {
+    baseParts = renderContinuedTurnParts(flattened
       ? [flattened, ...body.messages.slice(1)]
       : withoutAnswered(body.messages.slice(history.length), answered))
-    : renderInitialPromptParts(body, callerWorkDir, proc.instructionsInSession,
+  } else {
+    const initial = renderInitialPrompt(body, callerWorkDir, proc.instructionsInSession,
       reminder.length ? promptTextBytes(reminder) + 2 : 0)
+    baseParts = initial.parts
+    // what a replay into a new session kept, in counts (plugins#1401)
+    if (initial.stats.messages_before) {
+      logSessionEvent(proc, proc.sessionReason ?? null, { ...initial.stats, prompt_bytes: promptTextBytes(baseParts) }, "replay")
+    }
+  }
   const contentParts = mergePromptParts(baseParts, reminder)
   if (promptHasImage(contentParts) && !proc.supportsImages) {
     if (isFirstTurn) {
@@ -7189,6 +7902,12 @@ function noAgy() {
 // two accounts whose email can't be read aren't taken for one.
 async function signedInAs(homeId = "") {
   const email = await signedInEmail()
+  // agy's own sign-in: kept, so the account keeps working once agy holds
+  // another
+  if (!homeId && email) {
+    forgetStoredSignIn()
+    await keepOwn(email, await storedSignIn())
+  }
   const metadata = { ...(email ? { email } : {}), ...(homeId ? { agyHome: homeId } : {}) }
   return { type: "success", key: homeId ? `agy:${homeId}` : "agy", ...(Object.keys(metadata).length ? { metadata } : {}) }
 }
@@ -7232,6 +7951,8 @@ async function homeOfEmail(email) {
   let ids = []
   try { ids = fs.readdirSync(accountsDir()) } catch {}
   for (const id of ids) {
+    // a kept account of agy's own (keptHome) is that account, not another
+    if (isKeptId(id)) continue
     const home = homeOf(id)
     if (home && (await storedEmail({ home })).toLowerCase() === want) return id
   }
@@ -7285,18 +8006,63 @@ async function importSignIns(texts) {
 // homeOfAuth is the home of the account a saved sign-in is, null for
 // agy's own.
 async function homeOfAuth(getAuth) {
+  const { home, email } = await accountOfAuth(getAuth)
+  return home ?? ownHome(email, inAccount(null, () => storedSignInNow()))
+}
+
+// ownHome is where an account of agy's own (saved as email) runs, given
+// stored, agy's keyring read: agy's own (null) while agy holds it, or
+// can't tell, and its kept home (keptFor) while agy holds another. With
+// none kept, it is agy's own still, and is told agy holds another.
+// While agy holds it, it is kept again when agy's sign-in has changed.
+function ownHome(email, stored) {
+  if (!email) return null
+  if (heldByAnother(stored, email)) return keptFor(email)
+  inAccount(null, () => keepOwn(email, stored)).catch(() => {})
+  return null
+}
+
+// accountOfAuth is homeOfAuth, with the email an account of agy's own was
+// saved as ("" for one with a home: its home is its own).
+async function accountOfAuth(getAuth) {
   let auth
   try { auth = typeof getAuth === "function" ? await getAuth() : getAuth } catch {}
-  return homeOf(homeIdOfAuth(auth))
+  const home = homeOf(homeIdOfAuth(auth))
+  const email = !home && typeof auth?.metadata?.email === "string" ? auth.metadata.email.trim() : ""
+  return { home, email }
 }
 
 // One usage reader per account: each holds its own last report.
 const usageReaders = new Map()
-function readUsageOf(home) {
+// The accounts of agy's own told agy holds another (by email, lower case):
+// a read once agy holds them again says the sign-in works.
+const toldNotHeld = new Set()
+function readUsageOf(home, email = "") {
   const key = home ?? ""
   let read = usageReaders.get(key)
   if (!read) usageReaders.set(key, (read = createUsageReader(findAgy)))
-  return inAccount(home, () => read())
+  return inAccount(home, async () => {
+    if (email) {
+      let stored = null
+      try { stored = await storedSignIn() } catch {}
+      if (heldByAnother(stored, email)) {
+        // kept while agy held it: read with its own sign-in
+        const kept = keptFor(email)
+        const result = kept ? await readUsageOf(kept) : null
+        if (result && result.signIn !== "expired") {
+          return toldNotHeld.delete(email.toLowerCase()) && result.signIn === "kept" ? { ...result, signIn: "renewed" } : result
+        }
+        toldNotHeld.add(email.toLowerCase())
+        return { windows: [], error: notHeldError(email), signIn: "expired" }
+      }
+      await keepOwn(email, stored)
+    }
+    const result = await read()
+    if (email && !result.error && toldNotHeld.delete(email.toLowerCase()) && result.signIn === "kept") {
+      return { ...result, signIn: "renewed" }
+    }
+    return result
+  })
 }
 
 export const AntigravityBridgePlugin = async () => {
@@ -7318,7 +8084,10 @@ export const AntigravityBridgePlugin = async () => {
         },
       },
       // Magpie's usage hook; OpenCode ignores this extension. agy owns auth.
-      usage: async (getAuth) => readUsageOf(await homeOfAuth(getAuth)),
+      usage: async (getAuth) => {
+        const { home, email } = await accountOfAuth(getAuth)
+        return readUsageOf(home, email)
+      },
       // magpie's "Import accounts from a file…" (OpenCode ignores it): the
       // retired Antigravity plugin's sign-ins, which magpie's Move hands over
       importFrom: IMPORT_FROM.en,
@@ -7368,11 +8137,17 @@ export const AntigravityBridgePlugin = async () => {
       loader: async (getAuth) => {
         // the account's own home, null for agy's own sign-in: every agy
         // its requests run is started there
-        const home = await homeOfAuth(getAuth)
+        const { home: savedHome, email } = await accountOfAuth(getAuth)
         return {
           baseURL: "agy://local",
           apiKey: "agy",
-          fetch: (fetchInput, init = {}) => inAccount(home, async () => {
+          // an account of agy's own runs in its kept home while agy holds
+          // another (ownHome), from the last keyring read
+          // (none yet after a start: it is waited for, so the first
+          // request isn't sent as the account agy holds)
+          fetch: async (fetchInput, init = {}) => inAccount(savedHome ?? ownHome(email,
+            inAccount(null, () => storedSignInNow()) ?? (email ? await inAccount(null, () => storedSignIn()) : null)), async () => {
+            const home = currentHome()
             const requestUrl = typeof fetchInput === "string"
               ? fetchInput
               : fetchInput instanceof URL
@@ -7401,10 +8176,16 @@ export const AntigravityBridgePlugin = async () => {
             // nothing stored to sign agy in with: agy would only start its
             // own Google sign-in, so the account is told to sign in again
             // (from the last read; a request doesn't wait for a new one)
-            const notSignedIn = cannotSignIn(storedSignInNow())
+            const stored = storedSignInNow()
+            const notSignedIn = cannotSignIn(stored)
             if (notSignedIn) {
               return jsonError(401, `${notSignedIn}: sign in again in magpie, or run \`agy\` in a terminal`, undefined,
                 { headers: { "X-Magpie-Sign-In": "expired" } })
+            }
+            // an account of agy's own that agy no longer holds: its request
+            // would go out as the account agy holds now
+            if (heldByAnother(stored, email)) {
+              return jsonError(401, notHeldError(email), undefined, { headers: { "X-Magpie-Sign-In": "expired" } })
             }
             let body
             try {
@@ -7490,7 +8271,6 @@ export const AntigravityBridgePlugin = async () => {
                   if (proc.turn !== turn) return jsonError(409, "agy bridge: the tool response has already completed")
                   if (turn.attached) throw new BusyError("agy bridge: this conversation already has an active response")
                   if (turn.steering) throw new BusyError("agy bridge: this conversation is already steering this tool turn")
-                  noProgressRepeats.delete(convKey) // matched results are real progress
                   const rawResults = matches.map(({ block, match }) => ({
                     block,
                     call: match.call,
@@ -7547,9 +8327,14 @@ export const AntigravityBridgePlugin = async () => {
                     logBridgeEvent(proc, turn, "drop_live", dropReason, acquireOpts, {
                       history: trailingMessages(body).history.length,
                       expected_history: Array.isArray(proc.expectedMessages) ? proc.expectedMessages.length : null,
+                      // an interrupted turn is dropped when its history differs too
+                      history_matches: historyMatches,
                       tools_grew: !!proc.toolsGrew(tools),
                       work_dir_changed: proc.workDir !== workDir,
                       instructions_changed: !sameInstructions(proc.instructions, instructions),
+                      // where the history the client sent first differs from
+                      // the session's, with no text (yetone/magpie#7223)
+                      first_diff: historyMatches ? null : firstHistoryDiff(proc.expectedMessages, trailingMessages(body).history),
                     })
                     acquireOpts.dropReason = dropReason
                     dropFromPool(proc)
@@ -7568,38 +8353,38 @@ export const AntigravityBridgePlugin = async () => {
                 }
                 const held = heldFor(convKey, acquireOpts, resultBlocks) // Parallel lanes (local patch)
                 if (held?.turn && !held.turn.cancelRequested) {
+                  // No live MCP call waits for these results, but the
+                  // conversation's session holds a turn. A turn streaming to
+                  // another request is busy for now (503, the client tries
+                  // again once that response ends). Any other turn is left
+                  // behind: the client's own history has moved past it (a
+                  // sibling request replaced it, a resent or rewritten round,
+                  // renamed ids beside an earlier edit), so the request's own
+                  // tool round is replayed into a fresh session at once. Only
+                  // a round the request itself can't replay is refused, with
+                  // a 400 that stops retries and leaves the held turn alone.
                   const verdict = movedOnVerdict(held.turn, body.messages) ?? staleTurnVerdict(held, held.turn)
-                  let attempts
-                  if (!verdict.stale) {
-                    // An attached stream is live progress; only a quiet turn counts.
-                    if (verdict.reason === "attached" || verdict.reason === "steering") noProgressRepeats.delete(convKey)
-                    else attempts = noteNoProgressRepeat(convKey, held.turn)
-                    if (attempts == null || attempts < NO_PROGRESS_REPEAT_LIMIT) {
-                      logBridgeEvent(held, held.turn, "reject_active", verdict.reason, acquireOpts,
-                        attempts != null ? { attempts } : {})
-                      return jsonError(409, "agy bridge: no active MCP call matches these tool results")
-                    }
+                  if (!verdict.stale && (verdict.reason === "attached" || verdict.reason === "steering")) {
+                    logBridgeEvent(held, held.turn, "reject_active", verdict.reason, acquireOpts)
+                    throw new BusyError(verdict.reason === "steering"
+                      ? "agy bridge: this conversation is already steering this tool turn"
+                      : "agy bridge: this conversation already has an active response")
                   }
-                  // The held turn can never progress again, or the same unmatched
-                  // results hit it too often without progress: reclaim it and
-                  // replay this request's own tool round once, under one lock.
+                  const problem = replayHistoryProblem(body, resultBlocks)
+                  if (problem) {
+                    logBridgeEvent(held, held.turn, "replay_refused", problem, acquireOpts)
+                    throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
+                  }
                   const recovery = await recoverStaleTurn({ agy, convKey, proc: held, turn: held.turn,
-                    body, resultBlocks, acquireOpts, isFresh, begin, attempts })
+                    body, resultBlocks, acquireOpts, isFresh, begin })
                   if (recovery.kind === "replayed") return streamResponse(recovery.proc, recovery.turn, body, init.signal)
                   if (recovery.kind === "active") {
-                    return jsonError(409, "agy bridge: no active MCP call matches these tool results")
+                    throw new BusyError(recovery.reason === "steering"
+                      ? "agy bridge: this conversation is already steering this tool turn"
+                      : "agy bridge: this conversation already has an active response")
                   }
-                  if (recovery.kind === "conflict" || recovery.kind === "incomplete") {
-                    const code = recovery.kind === "conflict" ? "tool_state_conflict" : "tool_history_incomplete"
-                    const message = attempts != null
-                      ? `agy bridge: ${code}: these tool results matched no live call ${attempts} times without progress, and this conversation's tool state cannot be realigned. Stop resending them; restart from the last self-consistent user message.`
-                      : recovery.kind === "conflict"
-                        ? "agy bridge: this turn was already replaced. Stop resending this request."
-                        : "agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message."
-                    return jsonError(400, message, code, {
-                      noRetry: true,
-                      ...(attempts != null ? { extra: { attempts, turn_id: recovery.turnId } } : {}),
-                    })
+                  if (recovery.kind === "incomplete") {
+                    throw new ConflictError("agy bridge: incomplete tool history. Stop resending it; continue from the last self-consistent message.", "tool_history_incomplete")
                   }
                   // fallthrough: the turn went away or is being cancelled; take the normal path.
                 }
@@ -7623,6 +8408,17 @@ export const AntigravityBridgePlugin = async () => {
           }),
         }
       },
+    },
+    // The provider's name, which magpie shows on its Providers row and
+    // OpenCode in its model picker: with none, both fell back to the id
+    // (agy-cli). The same name as the plugin's row in registry.json, and
+    // the package its models are spoken to with, as provider.npm says. A
+    // name or package the user gave the provider in their own config is
+    // kept. The models come from provider.models.
+    config: async (cfg) => {
+      cfg.provider ??= {}
+      const was = cfg.provider[PROVIDER_ID] ?? {}
+      cfg.provider[PROVIDER_ID] = { npm: NPM_ANTHROPIC, ...was, name: was.name || PROVIDER_NAME }
     },
     provider: {
       id: PROVIDER_ID,
@@ -7674,7 +8470,7 @@ export const AntigravityBridgePlugin = async () => {
 
 // Only permanent tool-history 400s opt out of retries. Magpie header forwarding
 // has not been verified; busy responses and existing 409s retain their semantics.
-// `extra` merges diagnostic fields (attempts, turn_id) into the error object.
+// `extra` merges diagnostic fields into the error object.
 function jsonError(status, message, code, { extra, headers, noRetry = false } = {}) {
   return new Response(
     JSON.stringify({
