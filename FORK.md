@@ -18,7 +18,7 @@
    - 带着本机没有的工具结果回来（会话被网关换到别的 Magpie 后又切回来），而这里正有一条线在出流时，也开通道重放，不回 503（0.1.106 之前是 409）。
 
    一个对话最多 `AGY_BRIDGE_MAX_LANES` 个进程（默认 3，设成 1 就是上游行为），满了就复用最久没用的空闲通道；全机进程上限仍是 `AGY_BRIDGE_MAX_PROCS`，闲置 10 分钟的进程照常回收。代码里搜 `Parallel lanes (local patch)`。
-5. **thinking 关闭时照样转发思考**：有的网关会给没提 thinking 的请求补上 `"thinking": {"type": "disabled"}`。上游插件见到 disabled 就丢掉所有思考片段，可 agy 关不掉思考：`requestedEffort()` 只是不设档位，模型照默认档位思考，常常 8–12k token、两分钟以上。这期间流里只有 `message_start` 和 ping，网关等不到真正的内容就一直扣着流（最长 4 分钟），只发 `: keepalive` 注释；ZCode 这类 ai-sdk 客户端大约 155 秒就放弃，这次生成白做了。思考片段一到网关，网关就放行，插件 15 秒一次的 ping 也就能到客户端。现在 disabled 的请求也照常转发思考（`thinking_delta`），思考块带插件平时的签名（`thinkingSignature`），回放历史时和要了 thinking 的请求一样校验。非流式回复由同一个流拼出来，同样带思考块。设 `AGY_BRIDGE_THINKING_WHEN_DISABLED=0` 退回上游行为。代码里搜 `Thinking when disabled (local patch)`。
+5. **thinking 关闭时照样转发思考**：有的网关会给没提 thinking 的请求补上 `"thinking": {"type": "disabled"}`。上游插件见到 disabled 就丢掉所有思考片段，可 agy 关不掉思考：它没有关闭思考的档位，上游的 `requestedEffort()` 遇到 disabled 不设档位，于是选了这个模型的默认档（有 high 就是 high），想得最久，常常 8–12k token、两分钟以上。这期间流里只有 `message_start` 和 ping，网关等不到真正的内容就一直扣着流（最长 4 分钟），只发 `: keepalive` 注释；ZCode 这类 ai-sdk 客户端大约 155 秒就放弃，这次生成白做了。思考片段一到网关，网关就放行，插件 15 秒一次的 ping 也就能到客户端。现在 disabled 的请求也照常转发思考（`thinking_delta`），思考块带插件平时的签名（`thinkingSignature`），和要了 thinking 的请求一样（插件回放历史时不校验这个签名）。非流式回复由同一个流拼出来，同样带思考块。设 `AGY_BRIDGE_THINKING_WHEN_DISABLED=0` 退回上游行为。另外 disabled 的请求改选最低档（`disabledEffort()`）：请求带了 `output_config.effort` 就用它，否则用 low（只有一档的模型选最接近的那档）。本机实测 gemini-4-carbon 同一道长题，high 档首字 87–90 秒，low 档 7 秒。模型名带档位后缀（`-high`）时仍按后缀。设 `AGY_BRIDGE_DISABLED_EFFORT=0` 退回上游的默认档，设成别的档位名就用那一档。代码里搜 `Thinking when disabled (local patch)`。
 
 ## 为什么要绕一圈
 
@@ -42,6 +42,7 @@ agy 1.5.9 的 ACP 不收视频：用 image 块发会报 `unsupported mimeType`�
 | `AGY_BRIDGE_VIDEO_PRIVATE` | 关闭 | 设为 `1` 时允许下载内网或本机地址的视频链接。只在可信内网里用 |
 | `AGY_BRIDGE_MAX_LANES` | 3 | 一个对话最多同时用几个 agy 进程（并行通道）。设为 `1` 退回上游的一个对话一个进程 |
 | `AGY_BRIDGE_THINKING_WHEN_DISABLED` | 开启 | 请求写了 `thinking: {type: "disabled"}` 时仍转发思考。设为 `0` 退回上游行为（丢掉思考） |
+| `AGY_BRIDGE_DISABLED_EFFORT` | `low` | `thinking: {type: "disabled"}` 且没带 `output_config.effort` 时选的档位。设为 `0` 退回上游行为（模型默认档，通常是 high） |
 
 限制：
 - 单个视频最大 100 MB，这是 agy `read_file` 的上限。下载超时 120 秒，最多跟 3 次重定向。
@@ -71,7 +72,7 @@ magpie plugin add github:ifccod/opencode-agy-cli-auth#<tag>   # 例如 v0.1.87-v
 ```sh
 fork/fork.sh check      # 上游有没有新版本
 fork/fork.sh sync       # 导入上游快照，在 sync/<版本> 分支上合并，并跑测试
-fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0、AGY_BRIDGE_MAX_LANES=1、AGY_BRIDGE_THINKING_WHEN_DISABLED=0）
+fork/fork.sh test       # fork/video-selfcheck.mjs + fork/patch-e2e.mjs（补丁打开时）+ 上游测试（AGY_BRIDGE_VIDEO=0、AGY_BRIDGE_MAX_LANES=1、AGY_BRIDGE_THINKING_WHEN_DISABLED=0、AGY_BRIDGE_DISABLED_EFFORT=0）
 fork/fork.sh release    # 在 main 上打 v<版本>-video.<n> 标签，发 Release
 ```
 
