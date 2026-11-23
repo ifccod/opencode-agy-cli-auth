@@ -4,7 +4,7 @@
 #   fork/fork.sh check          上游有没有 main 还没合并的新版本（有：退出码 10，并列出提交和改到的文件）
 #   fork/fork.sh import [ref]   把上游 ref（默认 main）的 packages/agy-cli 原样快照提交到 upstream 分支
 #   fork/fork.sh sync [ref]     import，然后在 sync/<版本> 分支上合并 upstream，并跑测试
-#   fork/fork.sh test           上游测试 + 视频补丁自检
+#   fork/fork.sh test           上游测试 + 补丁自检
 #   fork/fork.sh release        在 main 上打 v<版本>-video.<n> 标签，推送，发 GitHub Release（附 npm pack 包）
 #
 # upstream 分支只放上游原样快照，每个提交的标题是 "upstream agy-cli <版本> (magpie-community/plugins@<sha>)"；
@@ -85,7 +85,10 @@ fail_count() { local n; n=$(sed -n 's/^ *\([0-9][0-9]*\) fail$/\1/p' "$1" | tail
 
 # Upstream tests with the video patch off (AGY_BRIDGE_VIDEO=0: the plugin must
 # then behave as upstream's, and upstream's tests say so; smoke.mjs checks
-# "tools: []"), plus the video selfcheck for the patch itself. A failure counts
+# "tools: []"), one process per conversation (AGY_BRIDGE_MAX_LANES=1:
+# unmatched-results.mjs wants 503 where a lane would replay) and thinking on
+# disabled requests dropped again (AGY_BRIDGE_THINKING_WHEN_DISABLED=0:
+# smoke.mjs checks that). test/testkit.mjs passes these three through, plus the video selfcheck for the patch itself. A failure counts
 # only when the upstream snapshot passes it in the same environment (a missing
 # or mismatched Go fails both).
 run_tests() {
@@ -96,7 +99,7 @@ run_tests() {
   local log base wt added
   log=$(mktemp)
   echo "bun test（约 2–3 分钟）…"
-  AGY_BRIDGE_VIDEO=0 bun test >"$log" 2>&1 || true
+  AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_MAX_LANES=1 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 bun test >"$log" 2>&1 || true
   grep -E '^ *[0-9]+ (pass|fail)$' "$log" || true
   [ -z "$(fails "$log")" ] && [ "$(fail_count "$log")" = 0 ] && return 0
   echo "有失败，对照上游快照在同一环境再跑一遍…"

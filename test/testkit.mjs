@@ -54,7 +54,7 @@ const RUNTIME_NAMES = ["Date", "setTimeout", "clearTimeout", "setInterval", "cle
 const RUNTIME_PRELUDE = `import { ${RUNTIME_NAMES.join(", ")} } from ${JSON.stringify(RUNTIME_SPECIFIER)};\n`
 const TEST_EXPORTS = "\nexport { Turn as __agyTestTurn, allProcs as __agyTestAllProcs, pool as __agyTestPool, " +
   "execOnce as __agyTestExecOnce, findAgy as __agyTestFindAgy, canonicalBody as __agyTestCanonicalBody, " +
-  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, reapOnExit as __agyTestReapOnExit };\n"
+  "conversationKey as __agyTestConversationKey, renderInitialPromptParts as __agyTestRenderInitialPromptParts, renderInitialPrompt as __agyTestRenderInitialPrompt, reapOnExit as __agyTestReapOnExit };\n"
 const IDENTIFIER_RE = /^[A-Za-z_$][\w$]*$/
 
 if (typeof vm.SourceTextModule !== "function" || typeof vm.SyntheticModule !== "function") {
@@ -516,6 +516,10 @@ export async function createBridgeKit(options = {}) {
     ...(options.storedSignIn === undefined ? { AGY_BRIDGE_STORED_SIGNIN: "skip" } : {}),
     // no spare agy unless a test asks: suites count spawns and ACP calls
     AGY_BRIDGE_SPARE: "0",
+    // Fork: the local patches' switches pass through, so fork/fork.sh can run
+    // upstream's suites with the patches off (a test's own env still wins).
+    ...Object.fromEntries(["AGY_BRIDGE_VIDEO", "AGY_BRIDGE_MAX_LANES", "AGY_BRIDGE_THINKING_WHEN_DISABLED"]
+      .filter((key) => process.env[key] != null).map((key) => [key, process.env[key]])),
     ...(options.env || {}),
   }
   for (const [key, value] of Object.entries(kit.env)) {
