@@ -99,7 +99,7 @@ run_tests() {
   local log base wt added
   log=$(mktemp)
   echo "bun test（约 2–3 分钟）…"
-  AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_MAX_LANES=1 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 bun test >"$log" 2>&1 || true
+  AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_MAX_LANES=1 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 AGY_BRIDGE_DISABLED_EFFORT=0 bun test >"$log" 2>&1 || true
   grep -E '^ *[0-9]+ (pass|fail)$' "$log" || true
   [ -z "$(fails "$log")" ] && [ "$(fail_count "$log")" = 0 ] && return 0
   echo "有失败，对照上游快照在同一环境再跑一遍…"

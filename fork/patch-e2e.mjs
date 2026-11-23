@@ -354,3 +354,28 @@ test("AGY_BRIDGE_THINKING_WHEN_DISABLED=0 drops the thoughts of a thinking: disa
     assert.deepEqual(streamed.content, [{ type: "text", text: "The answer." }])
   }, { env: { AGY_BRIDGE_THINKING_WHEN_DISABLED: "0" } })
 })
+
+// Thinking when disabled: disabled picks the lowest level (agy has no "off"),
+// the request's own output_config.effort first; a suffixed model keeps its suffix.
+async function launchedModel(kit, extra, user, model = "agy-cli/gemini-4-argon") {
+  kit.defaultPrompt = async (agent) => { await agent.text("ok"); return { stopReason: "end_turn" } }
+  await readSse(await kit.request(baseBody({ model, metadata: { user_id: user }, ...extra,
+    messages: [{ role: "user", content: "hi " + user }] })))
+  const set = kit.acpLog.filter((e) => /set_model|set_config_option/.test(e.method)).at(-1)
+  return set?.params?.modelId ?? set?.params?.value
+}
+
+test("thinking: disabled runs agy at the lowest level, or the request's output_config.effort", async () => {
+  await withKit(async (kit) => {
+    assert.equal(await launchedModel(kit, { thinking: { type: "disabled" } }, "off-low"), "gemini-4-argon-low")
+    assert.equal(await launchedModel(kit, { thinking: { type: "disabled" }, output_config: { effort: "medium" } }, "off-medium"), "gemini-4-argon-medium")
+    assert.equal(await launchedModel(kit, {}, "unset"), "gemini-4-argon-high", "no thinking field keeps the default")
+    assert.equal(await launchedModel(kit, { thinking: { type: "disabled" } }, "off-suffixed", "agy-cli/gemini-4-argon-high"), "gemini-4-argon-high")
+  })
+})
+
+test("AGY_BRIDGE_DISABLED_EFFORT=0 keeps upstream's default level for thinking: disabled", async () => {
+  await withKit(async (kit) => {
+    assert.equal(await launchedModel(kit, { thinking: { type: "disabled" } }, "off-upstream"), "gemini-4-argon-high")
+  }, { env: { AGY_BRIDGE_DISABLED_EFFORT: "0" } })
+})

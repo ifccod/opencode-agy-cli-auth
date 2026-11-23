@@ -1257,11 +1257,24 @@ function normalizeEffort(value) {
   return EFFORT_ORDER.includes(direct) ? direct : ""
 }
 
+// Thinking when disabled (local patch). agy has no level that turns thinking
+// off, and upstream leaves the effort unset on disabled, so the model ran at
+// the family's default level (high where there is one): the longest thinking
+// for a request that asked for none. disabled now takes the request's own
+// output_config.effort, else the lowest level (closestEffort finds the
+// family's nearest to "low"). AGY_BRIDGE_DISABLED_EFFORT names another level;
+// 0 keeps upstream's default level.
+function disabledEffort(body) {
+  const env = process.env.AGY_BRIDGE_DISABLED_EFFORT
+  if (env === "0") return ""
+  return normalizeEffort(body.output_config?.effort) || normalizeEffort(env) || "low"
+}
+
 function requestedEffort(body) {
   const forced = normalizeEffort(process.env.AGY_BRIDGE_EFFORT)
   if (forced) return forced
   const thinking = body.thinking?.type
-  if (thinking === "disabled") return ""
+  if (thinking === "disabled") return disabledEffort(body) // Thinking when disabled (local patch)
   const generic = [body.reasoning_effort, body.reasoningEffort, body.reasoning?.effort,
     body.generationConfig?.thinkingConfig?.thinkingLevel].map(normalizeEffort).find(Boolean)
   if (generic) return generic
@@ -7376,13 +7389,13 @@ function thinkingSignature(sessionId, thinking) {
 
 // Thinking when disabled (local patch). A gateway adds thinking: {type:
 // "disabled"} to requests that never mentioned thinking, but agy can't turn
-// thinking off: requestedEffort() only leaves the effort unset, and the model
-// still thinks at its default level, often for minutes. Dropping those
+// thinking off: it has no such level (disabledEffort picks the lowest), and
+// even at low the model may think for a while. Dropping those
 // thoughts left the stream with nothing but message_start and pings, so a
 // gateway holding the stream until real content arrives sent only keepalive
 // comments, and clients such as ZCode (ai-sdk) gave up first. The thoughts
-// now go out as usual thinking blocks with the bridge's signature, so the
-// replayed history validates as for a request that asked for thinking.
+// now go out as usual thinking blocks with the bridge's signature, as for a
+// request that asked for thinking (the bridge never checks it on replay).
 // AGY_BRIDGE_THINKING_WHEN_DISABLED=0 drops them again, as upstream does.
 function thinkingWhenDisabled() {
   return process.env.AGY_BRIDGE_THINKING_WHEN_DISABLED !== "0"
