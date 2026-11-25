@@ -642,7 +642,9 @@ test("only concurrent refreshes share work, and callers cannot mutate each other
   results[0].windows[0].used = 99
   assert.equal(results[1].windows[0].used, 25)
   await read()
-  assert.equal((await f.logs()).length, 4)
+  // the next refresh reads quota again; agy's --version answer is kept for
+  // its binary (plugins#1544)
+  assert.deepEqual((await f.logs()).map((call) => call.args[0]), ["--version", "-p", "-p"])
   await f.assertClean()
 })
 
@@ -892,6 +894,19 @@ test("invalid and oversized stdout/stderr reports fail within the output budget"
   }
 })
 
+// plugins#1544: agy --version took 5 to 17 seconds on a one-CPU Linux host,
+// and the quota read was given up at 3 seconds, before it could start.
+test("a slow agy --version can finish within the usage deadline, and is asked once", async t => {
+  const f = await fixture(t, { TEST_START_DELAY_MS: "4000" })
+  const result = await fetchUsage(f.executable, { ...f.options, first: true, quota: async () => SUMMARY })
+  assert.equal(result.windows.length, 2)
+  assert.deepEqual((await f.logs()).map(call => call.args), [["--version"]])
+  const again = await fetchUsage(f.executable, { ...f.options, first: true, quota: async () => SUMMARY })
+  assert.equal(again.windows.length, 2)
+  assert.deepEqual((await f.logs()).map(call => call.args), [["--version"]], "the same binary isn't asked its version again")
+  await f.assertClean()
+})
+
 test("version/report hangs time out, terminate the process, and leave no workspace", async t => {
   for (const mode of ["version-hang", "hang"]) {
     const f = await fixture(t, { TEST_MODE: mode })
@@ -1124,6 +1139,28 @@ test("a stored sign-in with time left is read directly first, so a slow agy -p d
   assert.equal(result.windows.length, 2)
   assert.equal(asked, 1)
   assert.deepEqual((await f.logs()).map(l => l.args[0]), ["--version"])
+  await f.assertClean()
+})
+
+// plugins#1522: a direct read that can't connect hung until the deadline,
+// and agy -p, run after it with a second left, timed the card out.
+test("a direct read that hangs leaves agy -p the time it needs", async t => {
+  const f = await fixture(t)
+  const deadlines = []
+  const quota = async o => {
+    deadlines.push(o.deadline - Date.now())
+    await new Promise(r => setTimeout(r, Math.max(0, o.deadline - Date.now())))
+    throw new Error("The operation timed out.")
+  }
+  const stored = { state: "present", fp: "live", canRenew: true, expiresAt: Date.now() + 10 * 60_000, expired: false }
+  const read = createUsageReader(() => f.executable, { ...f.options, timeoutMs: 9000, quota, signIn: async () => stored })
+  const result = await read()
+  assert.equal(result.error, undefined)
+  assert.equal(result.windows.length, 1)
+  assert.equal(deadlines.length, 1)
+  assert.ok(deadlines[0] <= 5000, `the direct read had ${deadlines[0]}ms`)
+  const p = (await f.logs()).find(l => l.args[0] === "-p")
+  assert.ok(Number(p.args.at(-1).replace(/s$/, "")) >= 3, `agy -p had ${p.args.at(-1)}`)
   await f.assertClean()
 })
 

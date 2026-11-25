@@ -9,6 +9,9 @@ import { cannotSignIn, isDead, noteDead, storedSignIn, storedToken } from "./sig
 const DEFAULT_TIMEOUT_MS = 15_000
 const MAX_TIMEOUT_MS = 18_000 // Magpie bounds an auth.usage call to 20 seconds.
 const MAX_OUTPUT_BYTES = 1024 * 1024
+// The direct read made before agy -p (fetchUsage's first) takes about 1.5
+// seconds; agy -p, 5 to 10. The first gets this long, agy -p the rest.
+const FIRST_READ_MS = 5_000
 
 // kind: "auth" (agy says it needs a sign-in), "timeout" (output: what agy
 // had printed by then, never shown), "cancel", or none.
@@ -258,6 +261,20 @@ export function parseUsageReport(value) {
 function timeout(value) {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
+}
+
+// What agy --version said, by the binary that said it: its real path, size
+// and modification time, so an updated agy is asked again.
+const versionCache = new Map()
+
+async function binaryKey(file) {
+  try {
+    const real = await fs.realpath(file)
+    const st = await fs.stat(real)
+    return `${real}\0${st.size}\0${st.mtimeMs}`
+  } catch {
+    return ""
+  }
 }
 
 function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKill }) {
@@ -525,13 +542,21 @@ export async function fetchUsage(agy, {
       BROWSER: path.join(directory, process.platform === "win32" ? "open.cmd" : "open"),
     })
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes, onTreeKill: p => { pendingTreeKill = p } }
-    // --version needs no sign-in, so its hang is never read as one
-    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) }).catch((error) => {
-      if (error?.kind === "timeout") throw new UsageError(error.message)
-      throw error
-    })
-    if (version.code !== 0) throw commandFailure(version.stderr)
-    if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
+    // --version needs no sign-in, so its hang is never read as one. It gets
+    // the whole deadline, and its answer is kept for the binary it came from:
+    // a 266 MB agy on a one-CPU Linux host takes 5 to 17 seconds just to say
+    // its version (plugins#1544), which left no time for the quota read.
+    const binary = await binaryKey(agy)
+    let version = binary && versionCache.get(binary)
+    if (!version) {
+      version = await run(agy, ["--version"], options).catch((error) => {
+        if (error?.kind === "timeout") throw new UsageError(error.message)
+        throw error
+      })
+      if (version.code !== 0) throw commandFailure(version.stderr)
+      if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
+      if (binary) versionCache.set(binary, { code: 0, stdout: version.stdout, stderr: "" })
+    }
     // agy's access token has ended (or is about to): agy renews it when it
     // runs, and when that renewal fails, even for a moment (DNS at startup,
     // a slow keyring), agy starts its own Google sign-in, which on Windows
@@ -561,10 +586,15 @@ export async function fetchUsage(agy, {
     // seconds. When they can't answer (a sign-in that can't be read, a
     // refusal, a reply with no quota), agy -p is asked as before, in the
     // time left, and its answer (a refusal, a sign-in agy asks for) stands.
+    //
+    // It gets FIRST_READ_MS of the deadline, not all of it: a read that
+    // can't connect (a proxy down, a network that drops Google) hung until
+    // the deadline and left agy -p a second, so the card said "timed out"
+    // when agy -p alone would have answered (plugins#1522).
     let firstFailed = ""
     if (first) {
       try {
-        const data = await quota({ env, version: version.stdout.trim(), deadline, signal })
+        const data = await quota({ env, version: version.stdout.trim(), deadline: Math.min(deadline, Date.now() + FIRST_READ_MS), signal })
         return parseUsageReport({ status: "SUCCESS", command: { name: "usage", data } })
       } catch (error) {
         if (signal?.aborted) throw new UsageError("agy usage query was cancelled.", { kind: "cancel" })
