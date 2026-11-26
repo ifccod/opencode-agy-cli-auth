@@ -2483,13 +2483,6 @@ class Proc {
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlServer.address().port),
     ]
-<<<<<<< HEAD
-    if (this.workDir) args.push("--add-dir", this.workDir)
-    if (videoOn()) {
-      await fs.promises.mkdir(mediaDir(), { recursive: true, mode: 0o700 })
-      args.push("--add-dir", mediaDir())
-    }
-=======
     // Opt-in: AGY_BRIDGE_ALLOW_AGY_TOOLS=1 hands every session/request_permission
     // to agy's own --dangerously-skip-permissions, so agy's built-in tools (shell,
     // edits, browser) auto-approve instead of the bridge refusing them. Default
@@ -2502,7 +2495,10 @@ class Proc {
     // client's tools, and drops the biggest of those (Bash, Read) to fit
     // (plugins#1405). The model is still told where the tools run.
     if (this.workDir && !holdsHome(this.workDir)) args.push("--add-dir", this.workDir)
->>>>>>> upstream
+    if (videoOn()) {
+      await fs.promises.mkdir(mediaDir(), { recursive: true, mode: 0o700 })
+      args.push("--add-dir", mediaDir())
+    }
     args.push(...await noDefaultCustomizationsArgs(this.agyPath))
     args.push(...await telemetryArgs(this.agyPath))
     const own = await geminiDirArgs(this.agyPath)
