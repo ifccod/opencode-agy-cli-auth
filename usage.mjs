@@ -254,13 +254,29 @@ export function parseUsageReport(value) {
   if (!windows.some(w => w.used !== undefined)) {
     throw new UsageError("Limits not available: agy returned no enabled, measured quota buckets.")
   }
-  // /usage has no verified account or plan identity. Do not borrow one elsewhere.
+  // /usage has no verified account or plan identity: none is made up from
+  // it. Only the direct read (readQuotaDirect, fromQuota) adds one: the plan
+  // its loadCodeAssist names and the email agy's stored sign-in names.
   return { windows: [...[...models.values()].sort((a, b) => a.name.localeCompare(b.name)), ...windows] }
 }
 
 function timeout(value) {
   const n = Number(value)
   return Number.isFinite(n) && n > 0 ? Math.min(n, MAX_TIMEOUT_MS) : DEFAULT_TIMEOUT_MS
+}
+
+// What agy --version said, by the binary that said it: its real path, size
+// and modification time, so an updated agy is asked again.
+const versionCache = new Map()
+
+async function binaryKey(file) {
+  try {
+    const real = await fs.realpath(file)
+    const st = await fs.stat(real)
+    return `${real}\0${st.size}\0${st.mtimeMs}`
+  } catch {
+    return ""
+  }
 }
 
 function run(file, args, { cwd, env, deadline, signal, maxOutputBytes, onTreeKill }) {
@@ -428,8 +444,19 @@ const companion = p => typeof p === "string" ? p : typeof p?.id === "string" ? p
 // project, the same account's quota answers 200.
 export const CONSUMER_PROJECT = "aicode-consumers"
 
+// planOf is the plan a loadCodeAssist reply names, as the retired
+// antigravity plugin read it: the paid tier's name, else the current
+// tier's, else that tier's id; "" when it names no tier.
+export function planOf(load) {
+  let t = load?.paidTier
+  if (!text(t?.name)) t = load?.currentTier ?? t
+  return text(t?.name) || text(t?.id)
+}
+
 // readQuotaDirect is retrieveUserQuotaSummary's reply for agy's stored
-// sign-in, as agy asks it. An access token with under two minutes left is
+// sign-in, as agy asks it (quota), with the plan loadCodeAssist named
+// (planOf) and the account the sign-in names (user, its id_token_email),
+// each "" when unnamed. An access token with under two minutes left is
 // renewed in memory only; agy's stored sign-in is never written.
 export async function readQuotaDirect({
   env = process.env, version, deadline, signal,
@@ -486,7 +513,23 @@ export async function readQuotaDirect({
     const why = text((load?.ineligibleTiers ?? []).find(x => text(x?.reasonMessage))?.reasonMessage)
     throw new UsageError(why ? `Antigravity names no project for this account (${why.slice(0, 300)})` : "Antigravity names no project for this account.")
   }
-  return call("retrieveUserQuotaSummary", { project })
+  const quota = await call("retrieveUserQuotaSummary", { project })
+  return { quota, plan: planOf(load), user: text(sign.id_token_email) }
+}
+
+// fromQuota is the usage a direct read gives: the windows of its quota,
+// with the plan and account readQuotaDirect named, when it named them. A
+// quota summary on its own (a quota read that returns just that) gives
+// the windows alone.
+function fromQuota(read) {
+  const named = read !== null && typeof read === "object" && Object.hasOwn(read, "quota")
+  const usage = parseUsageReport({ status: "SUCCESS", command: { name: "usage", data: named ? read.quota : read } })
+  if (!named) return usage
+  return {
+    ...usage,
+    ...(text(read.plan) ? { plan: text(read.plan) } : {}),
+    ...(text(read.user) ? { user: text(read.user) } : {}),
+  }
 }
 
 export async function fetchUsage(agy, {
@@ -528,13 +571,21 @@ export async function fetchUsage(agy, {
       BROWSER: path.join(directory, process.platform === "win32" ? "open.cmd" : "open"),
     })
     const options = { cwd: directory, env: childEnv, deadline, signal, maxOutputBytes, onTreeKill: p => { pendingTreeKill = p } }
-    // --version needs no sign-in, so its hang is never read as one
-    const version = await run(agy, ["--version"], { ...options, deadline: Math.min(deadline, Date.now() + 3000) }).catch((error) => {
-      if (error?.kind === "timeout") throw new UsageError(error.message)
-      throw error
-    })
-    if (version.code !== 0) throw commandFailure(version.stderr)
-    if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
+    // --version needs no sign-in, so its hang is never read as one. It gets
+    // the whole deadline, and its answer is kept for the binary it came from:
+    // a 266 MB agy on a one-CPU Linux host takes 5 to 17 seconds just to say
+    // its version (plugins#1544), which left no time for the quota read.
+    const binary = await binaryKey(agy)
+    let version = binary && versionCache.get(binary)
+    if (!version) {
+      version = await run(agy, ["--version"], options).catch((error) => {
+        if (error?.kind === "timeout") throw new UsageError(error.message)
+        throw error
+      })
+      if (version.code !== 0) throw commandFailure(version.stderr)
+      if (!supportedVersion(version.stdout)) throw new UsageError("agy usage reports require a verified agy version 1.1.11 or later. Update the CLI.")
+      if (binary) versionCache.set(binary, { code: 0, stdout: version.stdout, stderr: "" })
+    }
     // agy's access token has ended (or is about to): agy renews it when it
     // runs, and when that renewal fails, even for a moment (DNS at startup,
     // a slow keyring), agy starts its own Google sign-in, which on Windows
@@ -550,7 +601,7 @@ export async function fetchUsage(agy, {
         if (error instanceof UsageError) throw error
         throw new UsageError("agy's stored sign-in couldn't be renewed. Check the network or proxy.")
       }
-      return parseUsageReport({ status: "SUCCESS", command: { name: "usage", data } })
+      return fromQuota(data)
     }
     // With a stored sign-in to read it with, the quota is read first the
     // way agy's /usage reads it: loadCodeAssist, then
@@ -573,7 +624,7 @@ export async function fetchUsage(agy, {
     if (first) {
       try {
         const data = await quota({ env, version: version.stdout.trim(), deadline: Math.min(deadline, Date.now() + FIRST_READ_MS), signal })
-        return parseUsageReport({ status: "SUCCESS", command: { name: "usage", data } })
+        return fromQuota(data)
       } catch (error) {
         if (signal?.aborted) throw new UsageError("agy usage query was cancelled.", { kind: "cancel" })
         firstFailed = error instanceof UsageError ? error.message : "a network request failed"
@@ -605,7 +656,7 @@ export async function fetchUsage(agy, {
         throw alsoFailed(error instanceof UsageError ? error.message : "a network request failed")
       }
       try {
-        return parseUsageReport({ status: "SUCCESS", command: { name: "usage", data } })
+        return fromQuota(data)
       } catch {
         throw alsoFailed("Google's reply had no quota in it")
       }
