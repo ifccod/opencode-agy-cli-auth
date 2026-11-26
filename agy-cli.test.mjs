@@ -18,6 +18,7 @@ for (const [name, mocks] of [
   ["platform.mjs", true],
   ["compat.mjs", true],
   ["prefill.mjs", false],
+  ["images.mjs", false],
   ["usage.mjs", true],
   ["signin.mjs", false],
   ["catalog.mjs", false],
@@ -36,6 +37,7 @@ for (const [name, mocks] of [
   ["account-scope.mjs", false],
   ["stateless-reuse.mjs", false],
   ["tools-listed.mjs", false],
+  ["slash-commands.mjs", false],
   ["concurrent-convs.mjs", false],
   ["masking-drift.mjs", false],
   ["spilled-output.mjs", false],
@@ -47,6 +49,11 @@ for (const [name, mocks] of [
   ["duplicate-result-notice.mjs", false],
   ["image-slim.mjs", false],
   ["transient-history.mjs", false],
+  ["prompt-suggestion.mjs", false],
+  ["seed-replay.mjs", false],
+  ["session-continuity.mjs", false],
+  ["same-opening.mjs", false],
+  ["claude-code-sessions.mjs", false],
 ]) {
   test(`test/${name}`, () => {
     // bun's 5s default per test is a fixed wait these process-spawning tests
