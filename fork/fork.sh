@@ -103,14 +103,16 @@ run_tests() {
   local log base wt added
   log=$(mktemp)
   echo "bun test（约 2–3 分钟）…"
-  AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_MAX_LANES=1 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 AGY_BRIDGE_DISABLED_EFFORT=0 bun test >"$log" 2>&1 || true
+  # each run gets an empty HOME, as upstream runs them: this machine's own agy
+  # sign-ins otherwise reach signin/smoke/usage tests and fail them
+  HOME=$(mktemp -d) AGY_BRIDGE_VIDEO=0 AGY_BRIDGE_MAX_LANES=1 AGY_BRIDGE_THINKING_WHEN_DISABLED=0 AGY_BRIDGE_DISABLED_EFFORT=0 bun test >"$log" 2>&1 || true
   grep -E '^ *[0-9]+ (pass|fail)$' "$log" || true
   [ -z "$(fails "$log")" ] && [ "$(fail_count "$log")" = 0 ] && return 0
   echo "有失败，对照上游快照在同一环境再跑一遍…"
   wt=$(mktemp -d)
-  git worktree add -q --detach "$wt" upstream
+  git worktree add -q --detach "$wt" refs/heads/upstream
   base=$(mktemp)
-  (cd "$wt" && bun test >"$base" 2>&1) || true
+  (cd "$wt" && HOME=$(mktemp -d) bun test >"$base" 2>&1) || true
   git worktree remove --force "$wt"
   added=$(comm -23 <(fails "$log") <(fails "$base"))
   if [ -n "$added" ] || [ "$(fail_count "$log")" -gt "$(fail_count "$base")" ]; then
