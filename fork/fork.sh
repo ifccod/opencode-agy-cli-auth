@@ -62,6 +62,10 @@ import_ref() {
   ver=$(upstream_version "$sha")
   git remote get-url upstream >/dev/null 2>&1 || git remote add upstream "https://github.com/$UP_REPO.git"
   git fetch -q --depth=1 upstream "$sha"
+  # Actions pushes its snapshots to origin/upstream: a local branch left behind
+  # makes the merge base an old snapshot and every file it changed conflicts
+  git fetch -q origin upstream 2>/dev/null && git rev-parse -q --verify refs/heads/upstream >/dev/null &&
+    git merge-base --is-ancestor refs/heads/upstream origin/upstream && git branch -f upstream origin/upstream
   wt=$(mktemp -d)
   if git rev-parse -q --verify refs/heads/upstream >/dev/null; then
     git worktree add -q "$wt" upstream
