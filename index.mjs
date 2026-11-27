@@ -7,7 +7,7 @@ import net from "node:net"
 import os from "node:os"
 import path from "node:path"
 import { fileURLToPath } from "node:url"
-import { ACCOUNT_DISABLED_REFUSED, agyRefusal, createUsageReader, verifyLinkIn, verifyRefused } from "./usage.mjs"
+import { ACCOUNT_DISABLED_REFUSED, agyRefusal, createUsageReader, isEligibilityRefusal, verifyLinkIn, verifyRefused } from "./usage.mjs"
 import { catalogRows, storeCatalogRows } from "./model-ids.mjs"
 import { backgroundBlocked, cannotSignIn, forgetStoredSignIn, heldByAnother, homeForOwn, isKeptId, keepOwn, keptFor, keptOthers, notHeldError, ownerUnknown, signedInEmail, storedEmail, storedSignIn, storedSignInNow, unknownOwnerError, whoOf } from "./signin.mjs"
 import { sanitizePatternFields } from "./re2-pattern.mjs"
@@ -72,7 +72,7 @@ function maxProcs() {
 function detachedEvictMs() {
   return positiveTimeout(process.env.AGY_BRIDGE_DETACHED_EVICT_MS, 30_000)
 }
-const MAX_PARKED = 32
+const MAX_PARKED = 256
 const DEFAULT_PROC_START_TIMEOUT_MS = 60_000
 const TURN_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TURN_TIMEOUT_MS, 5 * 60 * 1000)
 const TOOL_RESULT_TIMEOUT_MS = positiveTimeout(process.env.AGY_BRIDGE_TOOL_TIMEOUT_MS, 30 * 60 * 1000)
@@ -545,11 +545,29 @@ async function listAgyModels(agyPath) {
   const { err, stdout, stderr, code, timedOut } = await execOnce(agyPath, await modelsArgs(agyPath), { timeoutMs: 15_000, unrefTimer: true })
   // null, not FALLBACK_MODELS: a failed listing must not overwrite a dynamic catalog.
   if (err || timedOut || code !== 0) {
-    if (!err && !timedOut) noteRefusal(agyRefusal(`${stderr}\n${stdout}`))
-    return null
+    if (err || timedOut) return null
+    const why = agyRefusal(`${stderr}\n${stdout}`)
+    const served = await servedDespite(agyPath, why)
+    noteRefusal(served ? "" : why)
+    return served
   }
   noteRefusal("")
   return parseAgyModels(stdout)
+}
+
+// plugins#1602 (cyclonevox: Google AI Pro, region SG): loadCodeAssist names
+// the account's tiers (standard-tier current, g1-pro-tier paid) and one it
+// can't have (free-tier, UNSUPPORTED_LOCATION). `agy models` and print mode
+// refuse on that entry ("Eligibility check failed"), while agy acp, which
+// every turn runs on, serves the account. So an eligibility refusal is the
+// account's only when agy acp names no tier for it either or offers no
+// model; otherwise what agy acp offers is the account's list.
+async function servedDespite(agyPath, why) {
+  if (!isEligibilityRefusal(why)) return null
+  const list = await listOffered(agyPath)
+  if (!ms().acpTier) return null
+  // asked within the last minute (probeOfferedOnce): what it offered then
+  return list || offeredList()
 }
 
 // What the last `agy models` of each account said when Google turned the
@@ -610,6 +628,10 @@ async function refusalNow(agyPath) {
   const { err, stdout, stderr, code, timedOut } = await execOnce(agyPath, await modelsArgs(agyPath), { timeoutMs: 15_000 })
   if (err || timedOut || code === 0) return ""
   const why = agyRefusal(`${stderr}\n${stdout}`)
+  if (await servedDespite(agyPath, why)) {
+    noteRefusal("")
+    return ""
+  }
   noteRefusal(why)
   return why
 }
@@ -666,6 +688,13 @@ async function probeSignedIn(agy) {
   // Google turned the account away (#3501): signing in again took, and
   // Google still refuses it; say so, not agy's last line alone
   const refused = !probe.err && !probe.timedOut ? agyRefusal(`${probe.stderr}\n${probe.stdout}`) : ""
+  const served = await servedDespite(agy, refused)
+  if (served) {
+    noteRefusal("")
+    useAgyPath(agy)
+    storeListedCatalog(agy, served, Date.now())
+    return { ok: true }
+  }
   if (refused) {
     noteRefusal(refused)
     return { ok: false, why: refused }
@@ -715,6 +744,7 @@ function ms() {
       wantOfferedProbe: false,
       acpOfferedModels: null,
       acpOfferedKey: "",
+      acpTier: null,
       offeredStale: false,
       offeredProbePromise: null,
       offeredProbeAt: null,
@@ -774,6 +804,7 @@ const OFFERED_PROBE_RETRY_MS = 60_000
 function forgetOffered() {
   ms().acpOfferedModels = null
   ms().acpOfferedKey = ""
+  ms().acpTier = null
   ms().offeredStale = false
   ms().offeredProbePromise = null
   ms().offeredProbeAt = null
@@ -836,7 +867,14 @@ async function probeOfferedModels(agyPath) {
       })
       if (agyTooOld(init?.agentInfo?.version ?? null)) return
       const session = await conn.request("session/new", { cwd: workspace, mcpServers: [] })
-      if (gen === state.offeredGen) inAccount(home, () => noteOfferedModels(session?.configOptions, session?.models))
+      if (gen === state.offeredGen) {
+        inAccount(home, () => {
+          // the tier agy acp says the account is served on (plugins#1602)
+          const tier = session?._meta?.antigravity?.tier?.id
+          ms().acpTier = typeof tier === "string" && tier ? tier : null
+          noteOfferedModels(session?.configOptions, session?.models)
+        })
+      }
       const caps = init?.agentCapabilities ?? {}
       if (session?.sessionId && (caps.sessionCapabilities?.close ?? caps.session_capabilities?.close)) {
         await conn.request("session/close", { sessionId: session.sessionId }).catch(() => {})
@@ -4039,10 +4077,10 @@ function validEntry(entry) {
     Number.isFinite(entry.at) && Date.now() - entry.at <= RESUME_TTL_MS
 }
 
-function loadParked() {
+function loadParked(entries) {
   if (parkedLoaded) return
   parkedLoaded = true
-  for (const entry of readStateFile().filter(validEntry).sort((a, b) => a.at - b.at)) {
+  for (const entry of (entries ?? readStateFile().filter(validEntry)).sort((a, b) => a.at - b.at)) {
     if (!parked.has(entry.key)) parked.set(entry.key, entry)
   }
 }
@@ -4177,7 +4215,15 @@ function resumeWorkspace(workspace) {
 // Why no parked session was taken goes in `miss.reason`: counts and names
 // only, never content (plugins#1495).
 function takeParked(convKey, opts, miss = {}) {
-  loadParked()
+  // The old host can finish parking a turn after this host has loaded the index.
+  const entries = readStateFile().filter(validEntry)
+  loadParked(entries)
+  const lookupKeys = opts.legacyConvKey ? [convKey, opts.legacyConvKey] : [convKey]
+  for (const entry of entries) {
+    if (!lookupKeys.includes(entry.key) || unparked.has(entry.key)) continue
+    const cached = parked.get(entry.key)
+    if (!cached || entry.at > cached.at) parked.set(entry.key, entry)
+  }
   let key = convKey
   let legacy = false
   if (!parked.has(key) && opts.legacyConvKey && parked.has(opts.legacyConvKey)) {
