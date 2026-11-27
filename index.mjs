@@ -10132,8 +10132,10 @@ export const AntigravityBridgePlugin = async () => {
               // or the one whose tool call the client never got, sent again. A
               // finished reply with no call pending is run anew, as a regenerate is.
               // Parallel lanes (local patch): the response may run in any lane.
+              // A finished step that answered tool results is upstream's
+              // (0.1.131 replay_tool_step: whole-request digest, same message id).
               const retrying = [...new Set([pool.get(convKey), ...laneGroup(convKey)])].filter((proc) => proc?.turn?.retry?.key &&
-                (proc.turn.attached || proc.turn.retry.reply?.stopReason === "tool_use"))
+                (proc.turn.attached || (!resultBlocks.length && proc.turn.retry.reply?.stopReason === "tool_use")))
               const wantKey = retrying.length ? retryKey(body) : null
               const liveProc = retrying.find((proc) => proc.turn.retry.key === wantKey)
               const liveRetry = liveProc?.turn?.retry
