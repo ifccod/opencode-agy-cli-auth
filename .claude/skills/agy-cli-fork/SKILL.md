@@ -31,14 +31,12 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
 
 有冲突时：
 
-- 补丁的标记是 `Video (local patch)`、`videoOn`、`mediaDir`、`videoizeBody`、`dropReadVideo`、`sniffVideo`、`privateAddress`，以及 `fetchVideo`、`videoBlock`。
-- 补丁一共挂在上游的 6 个位置：
-  1. `import dns from "node:dns"`
-  2. `FORWARD_THINKING` 后面的整段 helper
-  3. `agentDefinition()` 里的 `tools:` 那一行
-  4. `#spawn` 里 `--add-dir` 那一行后面
-  5. `#onNotification` 开头那一行
-  6. fetch 里 `body = await videoizeBody(JSON.parse(raw))`
+- 视频补丁（`Video (local patch)`）从 0.1.160 起只是一层转换，挂在 3 个位置：
+  1. `import dns from "node:dns"`；
+  2. `FORWARD_THINKING` 后面的整段 helper（`videoOn` 到 `videoizeBody`）；
+  3. fetch 里 `body = await videoizeBody(JSON.parse(raw))`。
+
+  媒体落盘、`tools: [view_file]`、`--add-dir` 都是上游的，冲突时一律用上游的。`fork/patch-e2e.mjs` 的视频用例可以验证（`AGY_BRIDGE_VIDEO=0` 时它应该失败）。
 - 重发接上原回合（`Retry attach (local patch)`），挂在五个位置：
   1. `streamResponse` 前面的 `retryKey`、`retryResponse` 两个函数，以及 `streamResponse` 里给 `turn.retry` 赋值的那一行；
   2. `makeAnthropicStream` 开头取 `const retry = turn.retry`；
@@ -48,7 +46,7 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
 
   `fork/patch-e2e.mjs` 的两个 retry 用例可以验证。容量不足改 503 的补丁上游 0.1.95 已自带，不再是我们的补丁；`patch-e2e.mjs` 里的 busy 用例留着当回归测试。
 - 工具被拒后回空的修复（`Denied ending (local patch)`），挂在四个位置：
-  1. `agentDefinition()` 末尾，`videoOn()` 时多加一行，说明 `read_file` 只能读媒体目录；
+  1. `agentDefinition()` 末尾，`media` 时多加一行，说明 `view_file` 只能读附带的媒体；
   2. `#onRequest` 的拒绝分支，在 `deniedPermissions++` 后面记下 `turn.denied`；
   3. `Turn.emitText` 开头清掉 `this.denied`；
   4. `#runTurn` 里 `turn.flushText()` 之后：`turn.denied` 还在、并且这期间没有新的客户端工具调用时，抛出 `AgentTurnError`。
@@ -60,7 +58,8 @@ fork/fork.sh sync          # 默认合并上游 main；也可以指定 ref：for
   3. 同一函数里，上游 `lineageVerdict` 那段之前插入的 `laneWanted` 分支，以及上游 `superseded` 事件后面的 `noteSuperseded`；`findLiveContinuedProc` 的条件多了 `key === convKey`，`why` 先取 `laneWhy`，`takeParked` 用 `key`；
   4. `recoverStaleTurn` 里 `current` 按 `ctx.proc.convKey` 取，重放时带 `laneKey`；
   5. fetch 里 Retry attach 的入口：在整组通道里找正在跑的那一轮；
-  6. fetch 里 409 分支的 `held` 改用 `heldFor(convKey, acquireOpts, resultBlocks)`。
+  6. fetch 里 409 分支的 `held` 改用 `heldFor(convKey, acquireOpts, resultBlocks)`；
+  7. `keepDroppedStep`（上游 0.1.158）里 `pool.get(proc.convKey)`，通道进程按自己的键存。
 
   `fork/patch-e2e.mjs` 的四个 lanes 用例可以验证；设 `LANES_PROBE=1` 再跑这几个用例，它们应该失败（409、503、409），说明用例确实能抓到上游行为。上游测试经 `test/testkit.mjs` 跑，那里的环境变量是隔离的；分叉在 testkit 里放行了 `AGY_BRIDGE_VIDEO`、`AGY_BRIDGE_MAX_LANES`、`AGY_BRIDGE_THINKING_WHEN_DISABLED` 三个开关（用例自己的 `env` 优先），`fork/fork.sh test` 跑上游测试时把它们都设成上游行为。上游 0.1.106 的 `test/unmatched-results.mjs` 要求“对方正在出流时，对不上的工具结果回 503”，并行通道打开时这里会开通道重放（200），所以上游测试要在 `AGY_BRIDGE_MAX_LANES=1` 下跑。改 `test/testkit.mjs` 的那几行合并上游时可能冲突，按原样接回。
 - thinking 关闭时照样转发思考（`Thinking when disabled (local patch)`），挂在三个位置：

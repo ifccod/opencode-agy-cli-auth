@@ -3,6 +3,7 @@
 import { test } from "node:test"
 import assert from "node:assert/strict"
 import fs from "node:fs"
+import http from "node:http"
 import path from "node:path"
 import { baseBody, createBridgeKit, readJson, readSse } from "../test/testkit.mjs"
 
@@ -64,30 +65,39 @@ test("the model quoting the high-traffic line mid-reply keeps it", async () => {
   })
 })
 
-test("a base64 video image block becomes a read_file prompt, and the file goes once agy has read it", async () => {
-  await withKit(async (kit) => {
-    const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypisom", "latin1"), Buffer.alloc(32)])
-    let file = null
-    kit.defaultPrompt = async (agent) => {
-      const prompt = (agent.prompt || []).map((p) => p.text || "").join("")
-      file = prompt.match(/\[Video attached: (\S+) /)?.[1]
-      assert.ok(file && fs.existsSync(file), "the bridge wrote the video before the prompt")
-      assert.deepEqual(fs.readFileSync(file), mp4)
-      agent.update({ sessionUpdate: "tool_call", toolCallId: "call_v", status: "completed", kind: "read",
-        rawInput: { Path: file }, locations: [{ path: file }] })
-      await agent.text("seen")
-      return { stopReason: "end_turn" }
-    }
-    const parsed = await readSse(await kit.request(baseBody({ metadata: { user_id: "video" }, messages: [{ role: "user", content: [
-      { type: "text", text: "what is in it?" },
-      { type: "image", source: { type: "base64", media_type: "video/mp4", data: mp4.toString("base64") } },
-    ] }] })))
-    assert.equal(parsed.error, null)
-    assert.match(promptText(kit), /Read it with read_file/)
-    assert.equal(path.basename(path.dirname(file)), "media")
-    for (let i = 0; i < 50 && fs.existsSync(file); i++) await new Promise((r) => setTimeout(r, 20))
-    assert.ok(!fs.existsSync(file), "the bridge's copy went after agy read it")
-  })
+// Video (local patch): an OpenAI image_url video, inline or by link, reaches
+// upstream's media staging (view_file, the session's attachments folder).
+test("a video sent as an image block, inline or by link, goes to agy as a file for view_file", async () => {
+  const mp4 = Buffer.concat([Buffer.from([0, 0, 0, 24]), Buffer.from("ftypisom", "latin1"), Buffer.alloc(32)])
+  let fetched = 0
+  const server = http.createServer((req, res) => { fetched++; res.writeHead(200, { "content-type": "application/octet-stream" }); res.end(mp4) })
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve))
+  const url = `http://127.0.0.1:${server.address().port}/clip`
+  try {
+    await withKit(async (kit) => {
+      const files = []
+      kit.defaultPrompt = async (agent) => {
+        const prompt = (agent.prompt || []).map((p) => p.text || "").join("")
+        for (const m of prompt.matchAll(/attached a video: (\S+?)\. Read it/g)) files.push(m[1])
+        await agent.text("seen")
+        return { stopReason: "end_turn" }
+      }
+      const ask = (block, user) => kit.request(baseBody({ model: "gemini-3.8-flash-high", metadata: { user_id: user }, messages: [{ role: "user", content: [
+        { type: "text", text: "what is in it?" }, block] }] }))
+      assert.equal((await readSse(await ask({ type: "image", source: { type: "base64", media_type: "video/mp4", data: mp4.toString("base64") } }, "inline"))).error, null)
+      assert.equal((await readSse(await ask({ type: "image", source: { type: "url", url } }, "link"))).error, null)
+      assert.equal((await readSse(await ask({ type: "video", source: { type: "url", url } }, "link-video"))).error, null)
+      assert.equal(files.length, 3, "each prompt names a staged file")
+      for (const file of files) {
+        assert.equal(path.basename(path.dirname(file)), "attachments")
+        assert.deepEqual(fs.readFileSync(file), mp4)
+      }
+      assert.equal(fetched, 1, "a link fetched once is read from the cache")
+      assert.ok(!kit.acpSpawns.some((s) => (s.args || []).join(" ").includes("magpie-agy-bridge/media")), "the download cache is no agy folder")
+    }, { env: { AGY_BRIDGE_VIDEO_PRIVATE: "1" } })
+  } finally {
+    server.close()
+  }
 })
 
 // agy asks the client to allow its own read_file on a path outside the media

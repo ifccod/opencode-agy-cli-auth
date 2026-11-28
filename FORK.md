@@ -4,10 +4,10 @@
 
 和上游相比多五处改动，都在 `index.mjs` 里（“容量不足报错改为 503”上游 0.1.95 已经自带，分叉里那份已删除）：
 
-1. **视频输入**：Gemini 能原生看视频，画面和声音都能处理。代码里搜 `Video (local patch)`。
+1. **视频输入（OpenAI 写法和链接）**：上游 0.1.155 起自带视频/音频输入，但只收 `video`/`audio` 块里的 base64，链接一律 400。补丁把 `image_url` 里的视频（`data:video/…` 或 http(s) 链接）和链接形式的 `video` 块转成上游的 base64 `video` 块，之后全走上游。代码里搜 `Video (local patch)`。
 2. **重发的请求接上原来那一轮**：客户端等不到首字就断开，把同一份请求再发一遍，而原请求还在跑；或者原请求的回复（一次工具调用）在路上丢了。上游插件对这种重发返回错误（0.1.106 之前一律是 409 `no active MCP call matches these tool results`，0.1.106 起原请求还在出流时是 503），要等原来那一轮结束才变，而原请求照常跑完并计费，产出没人收。现在重发的请求会等原请求出结果，拿到同一份回复，用量记 0，不重复计费。原请求失败或被取消时，重发的请求收到 503，客户端再发一次就会重新跑。已经正常结束、没有待答工具调用的回复不走这条路，再发一遍仍然重新生成。带工具结果的请求、原请求已经结束时，交给上游 0.1.131 的 `replay_tool_step`（比对整份请求的摘要，回放同一个消息 id）；本补丁只接原请求还在跑的重发，以及不带工具结果的请求丢了回复的重发。代码里搜 `Retry attach (local patch)`。
-3. **工具被拒后不再回空**：开放 `read_file` 以后，模型有时会拿它去读客户端机器上的路径，比如 ZCode 用户 Mac 上的 `~/.zcode/...`。这个工具在服务器上跑，读媒体目录以外的路径要先申请权限，插件会拒绝；agy 被拒后就直接结束这一轮。上游插件把这样的结束原样交给客户端，结果是空正文、没有工具调用，客户端看上去就是卡住不动。现在改成两处：
-   - agent 说明里写明 `read_file` 只能读附带的视频，其他文件用客户端的工具读。
+3. **工具被拒后不再回空**：带视频的会话开放 `view_file` 以后，模型有时会拿它去读客户端机器上的路径，比如 ZCode 用户 Mac 上的 `~/.zcode/...`。这个工具在服务器上跑，读会话目录以外的路径要先申请权限，插件会拒绝；agy 被拒后就直接结束这一轮。上游插件把这样的结束原样交给客户端，结果是空正文、没有工具调用，客户端看上去就是卡住不动。现在改成两处：
+   - 带视频的会话，agent 说明里写明 `view_file` 只能读附带的视频或音频，其他文件用客户端的工具读。
    - 一轮在被拒的工具上结束、之后既没有正文也没有客户端工具调用时，返回 `api_error`，错误信息写明是哪个工具被拒、为什么被拒。
    代码里搜 `Denied ending (local patch)`。
 4. **同一对话的并行线各用各的 agy 进程**：插件按“user_id + system + 第一条消息”认对话，一个对话只有一个 agy 进程。有的客户端在同一个会话里同时跑两条线，比如 ZCode 带着整份主对话另跑一个有工具调用的后台任务，两条线这三样都一样。上游会让后到的那条抢掉对方挂着的工具轮，或者让它等对方出完流（503 `this conversation still has an unfinished response`）；被抢的一方送回工具结果时，0.1.106 之前收到 409 `no active MCP call matches these tool results`；0.1.106 起改为重放，但会反过来抢掉对方挂着的那一轮，对方正在出流时则回 503。两条线来回互抢，每抢一次都要重放整份历史。现在：
@@ -22,12 +22,13 @@
 
 ## 为什么要绕一圈
 
-agy 1.5.9 的 ACP 不收视频：用 image 块发会报 `unsupported mimeType`，用 resource blob 发会被 `unsupported blob type` 丢掉。agy 自带的 `read_file` 却能把视频文件原生交给 Gemini。补丁的做法：
+agy 的 ACP 不收视频（image 块报 `unsupported mimeType`，resource blob 被 `unsupported blob type` 丢掉），只有它自己读文件的工具能把视频原生交给 Gemini。上游 0.1.155 的做法：把 `video`/`audio` 块写到会话工作区的 `attachments/<sha256>.<ext>`，prompt 里叫模型去读，只有带媒体的会话才有 `tools: [view_file]`，并且不加 `--add-dir`、把 TMPDIR 指到会话工作区，`view_file` 读不到别的目录。
+
+补丁只在这之前做转换：
 
 1. 客户端把视频当作图片发过来。OpenAI 协议写 `image_url`，值可以是 `data:video/mp4;base64,…`，也可以是 http(s) 链接。Magpie 会原样转成 `image` 块交给插件。
-2. 插件把视频写到 `~/.local/state/magpie-agy-bridge/media/<sha256>.<ext>`，并在 prompt 里告诉模型“视频在这个路径，用 read_file 读”。
-3. agent 改成 `tools: [read_file]`，用 `--add-dir` 把 media 目录加进工作区。这样读文件不会弹权限请求。
-4. agy 读完时会发出 `tool_call completed`，插件收到后马上删掉自己写的文件。agy 会在 `brain/<会话>/.system_generated/logs/media/` 里留一份副本，多轮对话靠它继续。
+2. base64 的直接改成 `video` 块。链接先下载（只认识别得出的视频，或 `Content-Type: video/*`），缓存在 `~/.local/state/magpie-agy-bridge/media/<sha256(链接)>`，同一个链接在后面的历史里再出现时读缓存，一小时没用的缓存在下次下载时清掉。
+3. 之后由上游写文件、开 `view_file`、拒绝非 Gemini 模型。
 
 ## 用法
 
@@ -38,18 +39,17 @@ agy 1.5.9 的 ACP 不收视频：用 image 块发会报 `unsupported mimeType`�
 
 | 环境变量 | 默认 | 作用 |
 |---|---|---|
-| `AGY_BRIDGE_VIDEO` | 开启 | 设为 `0` 时退回上游行为（`tools: []`，不处理视频） |
+| `AGY_BRIDGE_VIDEO` | 开启 | 设为 `0` 时退回上游行为（只收 `video`/`audio` 块的 base64） |
 | `AGY_BRIDGE_VIDEO_PRIVATE` | 关闭 | 设为 `1` 时允许下载内网或本机地址的视频链接。只在可信内网里用 |
 | `AGY_BRIDGE_MAX_LANES` | 3 | 一个对话最多同时用几个 agy 进程（并行通道）。设为 `1` 退回上游的一个对话一个进程 |
 | `AGY_BRIDGE_THINKING_WHEN_DISABLED` | 开启 | 请求写了 `thinking: {type: "disabled"}` 时仍转发思考。设为 `0` 退回上游行为（丢掉思考） |
 | `AGY_BRIDGE_DISABLED_EFFORT` | `low` | `thinking: {type: "disabled"}` 且没带 `output_config.effort` 时选的档位。设为 `0` 退回上游行为（模型默认档，通常是 high） |
 
 限制：
-- 单个视频最大 100 MB，这是 agy `read_file` 的上限。下载超时 120 秒，最多跟 3 次重定向。
+- 链接下载的视频最大 100 MB。下载超时 120 秒，最多跟 3 次重定向。
 - 链接只允许 http(s)，解析出的 IP 是内网、回环或链路本地地址时一律拒绝（400）。
 - 下载前会检查一次 DNS，但检查完到真正下载之间如果 DNS 被改指（DNS rebinding），这种情况防不住。
-- 开启后，模型可以用 `read_file` 直接读 agy 工作区里的文件，包括客户端的项目目录。上游插件“只桥接客户端工具”的隔离因此变宽了。
-- agy 的副本插件不会清理。
+- 下载缓存插件按一小时清理；上游写在会话工作区的 `attachments/` 随会话走。
 
 ## 安装
 

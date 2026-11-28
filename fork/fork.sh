@@ -136,7 +136,7 @@ sync() {
   if ! git merge --no-edit upstream; then
     echo
     echo "合并有冲突（见上）。解决后 git add + git commit，再跑 fork/fork.sh test。"
-    echo "冲突里搜 videoOn / mediaDir / dropReadVideo / videoizeBody，就是我们的补丁。"
+    echo "冲突里搜 local patch，就是我们的补丁；位置见 .claude/skills/agy-cli-fork/SKILL.md 第 2 节。"
     exit 1
   fi
   run_tests
