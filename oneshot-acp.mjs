@@ -6,6 +6,7 @@ import { currentHome } from "./account.mjs"
 import { spawnAgy, windowsTreeKill } from "./platform.mjs"
 import { agyRefusal } from "./usage.mjs"
 import { defuseSlashCommands } from "./cloak.mjs"
+import { writeDefaultAgentFiles } from "./default-agent.mjs"
 
 export const START_TIMEOUT_MS = 45 * 1000
 const EFFORT_ORDER = ["minimal", "low", "medium", "high", "xhigh", "max"]
@@ -299,15 +300,17 @@ async function classifyFailure({
   return new OneshotAgyError(502, summary)
 }
 
-// Run a single isolated `agy acp` session with a throwaway working folder and
-// agent definition, cleaning up the process, brain artifacts and temp folder
-// afterwards.
+// Run a single isolated `agy acp` session on agy's default agent, with a
+// throwaway working folder holding its instructions and tool gate
+// (default-agent.mjs: instructions, allowedTools), cleaning up the process,
+// brain artifacts and temp folder afterwards.
 export async function runOneshotAgySession({
   label,
   tempPrefix,
-  agentName,
-  agentDefinition,
+  instructions,
+  allowedTools = [],
   driverEnvVar,
+  model,
   timeoutMs,
   signal,
   deps,
@@ -336,7 +339,6 @@ export async function runOneshotAgySession({
   const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), tempPrefix))
   const wd = path.join(root, "wd")
   const logPath = path.join(root, "agy.log")
-  const agentDir = path.join(wd, ".agents", "agents", agentName)
 
   let child = null
   let conn = null
@@ -348,22 +350,18 @@ export async function runOneshotAgySession({
   const tracked = { child: null, root }
 
   try {
-    await fs.promises.mkdir(agentDir, { recursive: true, mode: 0o700 })
-    await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition, { encoding: "utf8", mode: 0o600 })
+    await fs.promises.mkdir(wd, { recursive: true, mode: 0o700 })
+    const own = typeof geminiDirArgs === "function" ? await geminiDirArgs(agyPath) : { dir: "", args: [] }
+    const geminiDir = own?.dir || path.join(currentHome() || os.homedir(), ".gemini")
+    agyDir = path.join(geminiDir, "antigravity-cli")
+    const hookEnv = await writeDefaultAgentFiles(wd, { instructions, allowed: allowedTools, geminiDir })
 
     const workdirState = typeof setupWorkdir === "function" ? await setupWorkdir(wd) : undefined
-
-    const own = typeof geminiDirArgs === "function" ? await geminiDirArgs(agyPath) : { dir: "", args: [] }
-    const home = currentHome()
-    agyDir = own?.dir
-      ? path.join(own.dir, "antigravity-cli")
-      : path.join(home || os.homedir(), ".gemini", "antigravity-cli")
 
     const noDefaults = typeof noDefaultCustomizationsArgs === "function" ? await noDefaultCustomizationsArgs(agyPath) : []
     const telemetry = typeof telemetryArgs === "function" ? await telemetryArgs(agyPath) : []
     const args = [
       "acp",
-      "--agent", agentName,
       "--log-file", logPath,
       ...noDefaults,
       ...telemetry,
@@ -376,6 +374,7 @@ export async function runOneshotAgySession({
       cwd: wd,
       stdio: ["pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: hookEnv,
     })
     tracked.child = child
     liveChildren.add(tracked)
@@ -454,7 +453,10 @@ export async function runOneshotAgySession({
       sessionId = session?.sessionId || ""
       if (!sessionId) throw new Error(`agy ${label} session/new returned no sessionId`)
 
-      const preferred = driverEnvVar ? (process.env[driverEnvVar] || "").trim() : ""
+      // a caller's model (an agy id it already resolved) comes before the
+      // driver's env setting
+      const preferred = (typeof model === "string" && model.trim()) ||
+        (driverEnvVar ? (process.env[driverEnvVar] || "").trim() : "")
       if (Array.isArray(session?.configOptions) && session.configOptions.length) {
         configOptions = session.configOptions
       }

@@ -1,4 +1,4 @@
-import { agyCandidates, childEnv, holdsHome, spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
+import { agyCandidates, childEnv, spawnAgy, windowsMcpShim, windowsNcBuild, windowsTreeKill } from "./platform.mjs"
 import { spawn, spawnSync } from "node:child_process"
 import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
 import { once } from "node:events"
@@ -25,30 +25,15 @@ import { cloakUser, DEFAULT_SLASH_COMMANDS, defuseSlashCommands, hint, outgoing,
 import { modelUsageCursor, modelUsageAfter, sessionDbPath } from "./step-usage.mjs"
 import { IMAGE_MODEL_ID, handleImageFetch, imageModelEntry, imageRoute } from "./image.mjs"
 import { reapOneshotChildren } from "./oneshot-acp.mjs"
+import { agentSummaryMode, agentSummaryRewrite, runAgentSummary } from "./agent-summary.mjs"
+import { writeDefaultAgentFiles } from "./default-agent.mjs"
 import { appGatewayOn as gatewayIn, gatewayFreeDir } from "./gateway-free.mjs"
+import { agyTooOld } from "./agy-version.mjs"
+
+export { agyTooOld, MIN_AGY_VERSION } from "./agy-version.mjs"
 
 const PROVIDER_ID = "agy-cli"
 const PROVIDER_NAME = "Antigravity (local agy CLI)"
-// Client tools reach the session through a private `nc` placed first on agy's
-// PATH: agy dials `--ide-mcp-port` by running `nc 127.0.0.1 <port>`. That is
-// how agy works, not a documented interface, and it was checked on 1.4.12 and
-// 1.5.0. An older agy is refused with a clear message; a version agy doesn't
-// report is not known to be older, so the session goes ahead.
-export const MIN_AGY_VERSION = "1.4.12"
-export function agyTooOld(version) {
-  const parse = value => {
-    const match = /^v?(\d+)\.(\d+)\.(\d+)/.exec(String(value ?? "").trim())
-    return match ? match.slice(1).map(Number) : null
-  }
-  const have = parse(version)
-  if (!have) return null
-  const need = parse(MIN_AGY_VERSION)
-  for (let i = 0; i < 3; i++) {
-    if (have[i] > need[i]) return null
-    if (have[i] < need[i]) return `agy ${version} is older than ${MIN_AGY_VERSION}, the oldest version this plugin was checked on. Update agy.`
-  }
-  return null
-}
 // agy is told who is connecting: this plugin, by its own package name.
 const CLIENT_INFO = (() => {
   try {
@@ -58,7 +43,6 @@ const CLIENT_INFO = (() => {
     return { name: "opencode-agy-cli-auth", version: "0.0.0" }
   }
 })()
-const AGENT_NAME = "magpie-bridge"
 const MCP_SERVER_PATH = fileURLToPath(new URL("./mcp-server.mjs", import.meta.url))
 // agy exposes tools from the --ide-mcp-port server as direct functions with this prefix.
 const IDE_TOOL_PREFIX = "mcp_ide-tools_"
@@ -229,17 +213,16 @@ const LINE_CORES = [...AGENT_ERROR_CORES, ...QUOTA_CORES, BUSY_CORE, ATTEMPT_COR
 const HOLD_MAX = Math.max(
   ...AGENT_ERROR_MARKERS.map((marker) => marker.length), CAP_MARKER.length, CAP_TAIL_CORE.length, ...QUOTA_MARKERS.map((marker) => marker.length), BUSY_MARKER.length,
 ) - 1
-// Opt-in. The minimal agent drops agy's own prompt components (~8,400 input
-// tokens a model call, against ~500 without them), so the request goes upstream
-// with the client's system prompt in their place. Not recommended: the
-// request no longer looks like the official agy client's, and a user reported
-// their account banned within hours of turning it on (limengy88811922 on X).
-const minimalAgent = () => process.env.AGY_BRIDGE_MINIMAL_AGENT === "1"
-const MINIMAL_AGENT_WARNING = "AGY_BRIDGE_MINIMAL_AGENT=1 is on: requests go upstream without agy's own system prompt, so they no longer look like the official agy client's. A user reported their account banned within hours of turning it on. Not recommended; unset it to go back."
+// AGY_BRIDGE_MINIMAL_AGENT=1 once ran a custom agent with
+// excludeDefaultComponents, which dropped agy's own prompt components. Every
+// session now runs on agy's default agent (a custom agent's session costs
+// about four times the quota from agy 1.5.17, google-antigravity/antigravity-cli#1890),
+// and the default agent has no such switch: the variable is told off once.
+const MINIMAL_AGENT_WARNING = "AGY_BRIDGE_MINIMAL_AGENT=1 no longer has an effect: every agy session now runs on agy's default agent, since from agy 1.5.17 a custom agent's session costs about four times the quota, and the default agent keeps agy's own system prompt. Unset it."
 // Once per process, though the module may be loaded more than once in it.
 const MINIMAL_WARNED = Symbol.for("magpie-community.agy-cli.minimal-agent-warned")
-function warnMinimalAgent() {
-  if (globalThis[MINIMAL_WARNED]) return
+function noteMinimalAgent() {
+  if (process.env.AGY_BRIDGE_MINIMAL_AGENT !== "1" || globalThis[MINIMAL_WARNED]) return
   globalThis[MINIMAL_WARNED] = true
   // A JSON row like the bridge's other stderr lines; AGY_BRIDGE_EVENTS=0
   // doesn't silence it.
@@ -412,6 +395,10 @@ const parked = new Map()
 const allProcs = new Set()
 const sessions = new Map()
 const toolCalls = new Map()
+// sessionId -> a stop in progress of the agy that holds it (Proc.stop)
+const stoppingSessions = new Map()
+// this host among the bridges that share the state file (rebaseHolderGone)
+const HOST_ID = `${process.pid}-${randomUUID().slice(0, 8)}`
 let cachedAgyPath
 let cachedAgySearchKey
 let controlServer
@@ -1041,30 +1028,18 @@ function probeOfferedOnce(agyPath) {
   return probe
 }
 
-// Web search, as agy itself searches (Kayphoon, magpie#7632): a session of
-// an agent whose one tool is agy's own search_web, asked for the query.
+// Web search, as agy itself searches (Kayphoon, magpie#7632): a session on
+// agy's default agent whose tool gate lets only agy's own search_web
+// through (default-agent.mjs), asked for the query.
 // agy runs the search on its account's side (Google Search grounding) and
 // keeps what it found in the session's step output; the pages are read
 // from there and the turn is cancelled, so the model writes no answer of
 // its own. Nothing goes to Google but through agy (the retired antigravity
 // plugin's direct calls are what got accounts turned away).
-const SEARCH_AGENT = "magpie-web-search"
 const SEARCH_TIMEOUT_MS = 60_000
-
-function searchAgentDefinition() {
-  return [
-    "---",
-    `name: ${SEARCH_AGENT}`,
-    "description: Searches the web",
-    "mainAgent: true",
-    "subagent: false",
-    "tools: [search_web]",
-    "inheritMcp: false",
-    "inheritCustomizations: false",
-    "---",
-    "Call search_web once with the user's query, as it is. Then stop.",
-    "",
-  ].join("\n")
+const SEARCH_AGENT_FILES = {
+  instructions: "Call search_web once with the user's query, as it is. Then stop. Every other tool is turned off in this session.",
+  allowed: ["search_web"],
 }
 
 class SearchStatusError extends Error {
@@ -1195,11 +1170,9 @@ async function searchAsAccount(query, count, email, abort) {
   let stop = () => {}
   try {
     workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-search-"))
-    const agentDir = path.join(workspace, ".agents", "agents", SEARCH_AGENT)
-    await fs.promises.mkdir(agentDir, { recursive: true })
-    await fs.promises.writeFile(path.join(agentDir, "agent.md"), searchAgentDefinition(), { mode: 0o600 })
-    const args = ["acp", "--agent", SEARCH_AGENT, ...await noDefaultCustomizationsArgs(agy), ...await telemetryArgs(agy), ...own.args]
-    child = spawnAgy(agy, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true })
+    const hookEnv = await writeDefaultAgentFiles(workspace, { ...SEARCH_AGENT_FILES, geminiDir: path.dirname(agyDir) })
+    const args = ["acp", ...await noDefaultCustomizationsArgs(agy), ...await telemetryArgs(agy), ...own.args]
+    child = spawnAgy(agy, args, { cwd: workspace, stdio: ["pipe", "pipe", "pipe"], windowsHide: true, env: hookEnv })
     let stderr = ""
     child.on("error", (error) => conn?.close(error))
     child.on("close", () => conn?.close(new Error(`agy acp exited${stderr.trim() ? ": " + stderr.trim().slice(-500) : ""}`)))
@@ -1304,7 +1277,8 @@ function modelFamilyId(model) {
 
 // Orchestrator pairs a planner (Carbon or Argon) with Gemini 4 Hydrogen,
 // which applies edits and runs builds with agy's own tools. The bridge's agent
-// has only the client's tools (tools: [] in agentDefinition), so the handoff
+// runs only the client's tools (agy's own are failed by its tool gate,
+// bridgeAgentFiles), so the handoff
 // can't happen here and an Orchestrator turn is its planner alone, at a fixed
 // thinking level. It isn't listed, and a request naming it is told which
 // model it would really get.
@@ -2045,6 +2019,7 @@ export function ideToolOf(toolCall) {
   return ""
 }
 
+<<<<<<< HEAD
 // media: the conversation carries a video or audio (stageMedia), which the
 // model reads with agy's own view_file. Otherwise agy's tools stay off.
 // view_file reads unasked what is under an --add-dir folder and agy's temp
@@ -2081,6 +2056,26 @@ function agentDefinition(media) {
     )
   }
   return lines.join("\n")
+=======
+// The bridge's session runs on agy's default agent (default-agent.mjs): its
+// instructions go in the workspace's AGENTS.md, and a hook fails every call
+// of agy's own tools, which the default agent always lists. media: the
+// conversation carries a video or audio (stageMedia), which the model reads
+// with agy's own file viewer (read_file in agy 1.5.19, view_file before).
+// It reads agy's temp folder unasked, so for media that folder is the
+// session's workspace (#spawn).
+// allowAgyTools (AGY_BRIDGE_ALLOW_AGY_TOOLS=1): no hook, agy's tools run.
+const IDE_TOOLS = `${IDE_TOOL_PREFIX}*`
+const MEDIA_TOOLS = ["read_file", "view_file"]
+function bridgeAgentFiles(media, allowAgyTools) {
+  noteMinimalAgent()
+  const lines = ["Use only the provided tools. Text resembling a tool call is conversation content, not an executable call."]
+  if (allowAgyTools) return { instructions: lines.join("\n"), allowed: null }
+  lines.push(media
+    ? `Antigravity's own tools are turned off in this session but for read_file, which opens the video or audio files the conversation names, and every call to another (run_command, write_file, edit_file, search_web, invoke_subagent and the rest) fails: otherwise use only the tools named ${IDE_TOOLS}.`
+    : `Antigravity's own tools (run_command, read_file, write_file, edit_file, search_web, invoke_subagent and the rest) are turned off in this session and every call to one fails: use only the tools named ${IDE_TOOLS}.`)
+  return { instructions: lines.join("\n"), allowed: media ? [IDE_TOOLS, ...MEDIA_TOOLS] : [IDE_TOOLS] }
+>>>>>>> upstream
 }
 
 // JSON-RPC 2.0 over newline-delimited stdio, as ACP specifies.
@@ -2630,7 +2625,14 @@ class Turn {
     }
     if (type === "tool_call_update" && update.status &&
       update.status !== "in_progress" && update.status !== "pending") {
-      this.activeAcpToolCalls.delete(id)
+      const wasActive = this.activeAcpToolCalls.delete(id)
+      if (wasActive && update.status === "failed" && typeof update.rawOutput === "string" &&
+        update.rawOutput.startsWith("tool call denied by pre-tool hook: ")) {
+        this.proc.deniedHooks++
+        logBridgeEvent(this.proc, this, "tool_denied", "pre_tool_hook", {}, {
+          denied_hooks: this.proc.deniedHooks, denied_permissions: this.proc.deniedPermissions,
+        })
+      }
       this.notifyAcpTools()
     }
   }
@@ -2776,6 +2778,7 @@ class Proc {
     this.listWaiters = []
     this.watchers = new Set()
     this.deniedPermissions = 0
+    this.deniedHooks = 0
     // How long each step of starting agy took, in ms, for the session row
     // of the bridge's events (initialize, session/new, the model's options)
     this.phases = {}
@@ -2851,6 +2854,7 @@ class Proc {
     this.lastCacheRatio = undefined
     this.pendingFlattenedTurn = undefined
     this.deniedPermissions = 0
+    this.deniedHooks = 0
     this.inputTokenScale = 1
     this.lastUsed = Date.now()
     this.phases = {}
@@ -2875,40 +2879,32 @@ class Proc {
     } else {
       this.workspace = await fs.promises.mkdtemp(path.join(os.tmpdir(), "magpie-agy-bridge-"))
     }
-    const agentDir = path.join(this.workspace, ".agents", "agents", AGENT_NAME)
-    await fs.promises.mkdir(agentDir, { recursive: true })
-    await fs.promises.writeFile(path.join(agentDir, "agent.md"), agentDefinition(this.media), { mode: 0o600 })
+    // Opt-in: AGY_BRIDGE_ALLOW_AGY_TOOLS=1 hands every session/request_permission
+    // to agy's own --dangerously-skip-permissions, so agy's built-in tools (shell,
+    // edits, browser) auto-approve instead of the bridge refusing them, and
+    // the workspace gets no tool gate. Default stays deny-by-bridge for
+    // anyone not setting it.
+    const allowAgyTools = /^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_ALLOW_AGY_TOOLS || "")
+    const own = await geminiDirArgs(this.agyPath)
+    const home = currentHome()
+    const geminiDir = own.dir || path.join(home || os.homedir(), ".gemini")
+    const hookEnv = await writeDefaultAgentFiles(this.workspace, { ...bridgeAgentFiles(this.media, allowAgyTools), geminiDir })
     this.logPath = path.join(this.workspace, "agy-acp.log")
 
     const args = [
       "acp",
-      "--agent", AGENT_NAME,
       "--log-file", this.logPath,
       "--ide-mcp-port", String(controlServer.address().port),
     ]
-    // Opt-in: AGY_BRIDGE_ALLOW_AGY_TOOLS=1 hands every session/request_permission
-    // to agy's own --dangerously-skip-permissions, so agy's built-in tools (shell,
-    // edits, browser) auto-approve instead of the bridge refusing them. Default
-    // stays deny-by-bridge for anyone not setting it.
-    if (/^(?:1|true|on|yes)$/i.test(process.env.AGY_BRIDGE_ALLOW_AGY_TOOLS || "")) {
-      args.push("--dangerously-skip-permissions")
-    }
-    // never the home folder or one above it: agy loads what is in it as the
-    // workspace's customizations, inside the same 20k budget as the
-    // client's tools, and drops the biggest of those (Bash, Read) to fit
-    // (plugins#1405). The model is still told where the tools run. Nor with
-    // media: view_file would read everything in it unasked.
-    if (this.workDir && !this.media && !holdsHome(this.workDir)) args.push("--add-dir", this.workDir)
+    if (allowAgyTools) args.push("--dangerously-skip-permissions")
+    // Only the bridge's workspace supplies project customizations. The
+    // caller's directory still goes to the model in workDirNote.
     args.push(...await noDefaultCustomizationsArgs(this.agyPath))
     args.push(...await telemetryArgs(this.agyPath))
-    const own = await geminiDirArgs(this.agyPath)
     args.push(...own.args)
-    // agy writes the conversation's steps under the folder it was given
-    const home = currentHome()
     // where agy keeps each session's brain, a tool output it cut short
     // among it (spilledOutput)
-    this.agyDir = own.dir ? path.join(own.dir, "antigravity-cli")
-      : path.join(home || os.homedir(), ".gemini", "antigravity-cli")
+    this.agyDir = path.join(geminiDir, "antigravity-cli")
     this.conversationsDir = process.env.AGY_BRIDGE_CONVERSATIONS_DIR ? null
       : own.dir ? path.join(own.dir, "antigravity-cli", "conversations")
         : home ? path.join(home, ".gemini", "antigravity-cli", "conversations")
@@ -2925,6 +2921,7 @@ class Proc {
         windowsHide: true,
         env: {
           ...childEnv,
+          ...hookEnv,
           PATH: bin + path.delimiter + inheritedPath,
           AGY_BRIDGE_CONTROL_PORT: String(controlServer.address().port),
           AGY_BRIDGE_TOKEN: this.token,
@@ -3274,6 +3271,10 @@ class Proc {
     }
     const turn = new Turn(this, messages)
     turn.model = model
+    // the rows agy holds once this turn's prompt went in, and once each
+    // step's results went in (recordToolResults): where a rebase may cut
+    // the session (sessionPrefix)
+    turn.rowMarks = [messages.map((message) => ({ ...message }))]
     this.turn = turn
     this.expectedMessages = messages.map((message) => ({ ...message }))
     this.historyInvalid = false
@@ -3425,6 +3426,9 @@ class Proc {
   recordToolResults(turn, messages) {
     if (this.turn !== turn) return
     this.expectedMessages = messages.map((message) => ({ ...message }))
+    turn.rowMarks?.push(this.expectedMessages.slice())
+    // the results agy took so far are in these rows (parkRebase)
+    for (const call of turn.calls) if (call.mcpResponded) call.marked = true
     parkStep(this)
   }
 
@@ -3953,6 +3957,12 @@ class Proc {
   #respondMcp(call, payload) {
     if (call.mcpResponded) return
     call.mcpResponded = true
+    // parked for a rebase (forgetCalls): agy hears nothing for the call, so
+    // its session stays at the parked rows; the socket goes with the agy
+    if (call.silenced) {
+      call.socket?.destroy()
+      return
+    }
     if (call.socket?.writable) call.socket.end(JSON.stringify(payload) + "\n")
     else call.socket?.destroy()
   }
@@ -4004,6 +4014,17 @@ class Proc {
     this.finalizeTurn(turn)
   }
 
+  // A turn whose session is parked for a rebase: its calls leave the
+  // registry at once, so a retry of the same results while agy stops finds
+  // no live call (and is not dropped again), and none is answered.
+  forgetCalls(turn) {
+    for (const call of turn.calls) {
+      clearTimeout(call.deadline)
+      call.silenced = true
+      if (call.id && toolCalls.get(call.id)?.call === call) toolCalls.delete(call.id)
+    }
+  }
+
   fail(error) {
     this.turn?.fail(error)
     dropFromPool(this)
@@ -4029,7 +4050,14 @@ class Proc {
 
   stop() {
     if (this.stopPromise) return this.stopPromise
+    const sessionId = this.sessionId
     this.stopPromise = this.#stop()
+    if (sessionId) {
+      const stopping = this.stopPromise.catch(() => {}).finally(() => {
+        if (stoppingSessions.get(sessionId) === stopping) stoppingSessions.delete(sessionId)
+      })
+      stoppingSessions.set(sessionId, stopping)
+    }
     return this.stopPromise
   }
 
@@ -4042,12 +4070,14 @@ class Proc {
   }
 
   async #stop() {
-    if (this.turn && this.sessionId && !this.keepsParkedStep(this.turn)) unparkSession(this.convKey, this.sessionId)
+    if (this.turn && this.sessionId && !this.keepsParkedStep(this.turn) && !this.rebaseParked) unparkSession(this.convKey, this.sessionId)
     this.stopping = true
     this.turn?.fail(new Error("stopped"))
     this.#markDead(new Error("stopped"))
     sessions.delete(this.token)
-    if (this.turn) {
+    // parked for a rebase (parkRebase): agy must not take an error for an
+    // open call and go on past the parked rows; it is stopped as it waits
+    if (this.turn && !this.rebaseParked) {
       for (const call of this.turn.calls) {
         if (call.mcpSeen && !call.mcpResponded) {
           this.#respondMcp(call, { error: { code: -32603, message: "agy bridge: process stopped" } })
@@ -4077,7 +4107,26 @@ class Proc {
     this.child = null
     // A resumed session's agy starts again in this folder; never remove it
     // from under one that already has.
-    if (this.workspace && ![...allProcs].some((proc) => proc !== this && proc.workspace === this.workspace)) {
+    if (this.workspace && this.rebaseParked) {
+      // Parked for a rebase, the folder goes with the session: a host that
+      // took the entry resumes in it (once this agy is gone,
+      // rebaseHolderGone) and removes it when it is done. Checked and
+      // removed under the state file's lock, which a take holds too, so
+      // the folder never goes from under an agy that resumed in it.
+      if (![...allProcs].some((proc) => proc !== this && proc.workspace === this.workspace)) {
+        const { convKey, sessionId, workspace } = this
+        try {
+          withStateLock(sessionStateFile(), () => {
+            if (!readStateFile().some((entry) => entry?.key === convKey && entry.sessionId === sessionId && entry.rebase)) {
+              // taken by another host: never written back from this one's copy
+              if (parked.get(convKey)?.sessionId === sessionId) parked.delete(convKey)
+              return
+            }
+            fs.rmSync(workspace, { recursive: true, force: true })
+          })
+        } catch {}
+      }
+    } else if (this.workspace && ![...allProcs].some((proc) => proc !== this && proc.workspace === this.workspace)) {
       const removal = this.#removeWorkspace()
       workspaceRemovals.set(this.workspace, removal)
       await removal
@@ -4379,7 +4428,7 @@ function withStateLock(file, fn) {
 function saveParked() {
   const file = sessionStateFile()
   try {
-    withStateLock(file, () => {
+    return withStateLock(file, () => {
       const merged = new Map()
       for (const entry of readStateFile().filter(validEntry)) merged.set(entry.key, entry)
       for (const key of unparked) merged.delete(key)
@@ -4391,8 +4440,11 @@ function saveParked() {
       fs.writeFileSync(temp, JSON.stringify({ version: 1, entries }) + "\n", { mode: 0o600 })
       fs.renameSync(temp, file)
       unparked.clear()
-    })
-  } catch {}
+      return true
+    }) === true
+  } catch {
+    return false
+  }
 }
 
 function unpark(convKey) {
@@ -4435,27 +4487,163 @@ function unparkSession(convKey, sessionId) {
   if (own(parked.get(convKey)) || readStateFile().some(own)) unpark(convKey)
 }
 
-function writeParked(proc, midTurn) {
+function writeParked(proc, midTurn, rebase = null) {
   loadParked()
   parked.delete(proc.convKey)
   unparked.delete(proc.convKey)
+  const held = rebase?.rows ?? proc.expectedMessages
   parked.set(proc.convKey, {
     key: proc.convKey,
     sessionId: proc.sessionId,
-    historyHash: digest(historyKey(proc.expectedMessages)),
-    historyHashSansInputs: digest(historyKey(stripToolUseInputs(proc.expectedMessages))),
-    toolUseIdentitiesHash: digest(toolUseIdentitiesKey(proc.expectedMessages) ?? ""),
+    historyHash: digest(historyKey(held)),
+    historyHashSansInputs: digest(historyKey(stripToolUseInputs(held))),
+    toolUseIdentitiesHash: digest(toolUseIdentitiesKey(held) ?? ""),
     instructionsHash: digest(sentInstructionsIdentity(proc.instructions)),
     userCloak: USER_CLOAK,
     instructionsInSession: !!proc.instructionsInSession,
+    defaultAgent: true,
     workDir: proc.workDir,
     workspace: proc.workspace,
     media: proc.media,
-    ...midTurn ? { midTurn: true, count: proc.expectedMessages.length } : {},
+    // a rebase entry also names the request that left the session (taken
+    // only by one going on from it) and the agy still holding the session
+    // as it stops (rebaseHolderGone)
+    ...rebase ? {
+      rebase: true, count: rebase.rows.length, beyond: !!rebase.beyond,
+      requestHash: digest(historyKey(rebase.messages)), requestCount: rebase.messages.length,
+      stopping: true, holder: { pid: proc.child?.pid ?? null, host: HOST_ID },
+    }
+      : midTurn ? { midTurn: true, count: proc.expectedMessages.length } : {},
     at: Date.now(),
   })
   while (parked.size > MAX_PARKED) parked.delete(parked.keys().next().value)
   saveParked()
+  // Another host can take a rebase entry while this host is still stopping agy.
+  if (rebase) parked.delete(proc.convKey)
+}
+
+function samePrefix(rows, messages, count) {
+  const held = rows.slice(0, count)
+  const actual = messages.slice(0, count)
+  if (historyKey(held) === historyKey(actual)) return true
+  return sameToolUseIdentities(held, actual) &&
+    historyKey(stripToolUseInputs(held)) === historyKey(stripToolUseInputs(actual))
+}
+
+// The longest run of rows this session's agy holds that the client's
+// messages still begin with, at most `limit` of them: any prefix of what
+// the session was last known to hold (expectedMessages, the step's model
+// output included), or a row boundary a step recorded (turn.rowMarks: the
+// turn's prompt, each step's results). Null when none is shared.
+function sessionPrefix(proc, turn, messages, limit) {
+  let best = 0
+  let from = null
+  const expected = Array.isArray(proc.expectedMessages) ? proc.expectedMessages : []
+  // a prefix that matches has matching prefixes below it: the longest by halves
+  let lo = 0
+  let hi = Math.min(expected.length, limit)
+  while (lo < hi) {
+    const mid = (lo + hi + 1) >> 1
+    if (samePrefix(expected, messages, mid)) lo = mid
+    else hi = mid - 1
+  }
+  if (lo > 0) [best, from] = [lo, expected]
+  const marks = (Array.isArray(turn?.rowMarks) ? turn.rowMarks : [])
+    .filter((rows) => rows.length > best && rows.length <= limit)
+    .sort((a, b) => b.length - a.length)
+  for (const rows of marks) {
+    if (samePrefix(rows, messages, rows.length)) {
+      [best, from] = [rows.length, rows]
+      break
+    }
+  }
+  return from ? from.slice(0, best) : null
+}
+
+// What the client has after the shared rows and before its own last
+// messages goes into the rebased prompt as text, and stays in the session
+// beside the session's own copy. Past this, the whole replay is cheaper
+// to carry than the doubled tail.
+const REBASE_TAIL_MAX_BYTES = 64 * 1024
+
+// The tail (what the client has between the shared rows and its own last
+// messages) past 64KB, or past half the whole conversation: then the
+// replay costs less than the session carrying both copies.
+function rebaseTailTooBig(messages, count, historyLength) {
+  const tail = messages.slice(count, Math.max(count, historyLength))
+  if (!tail.length) return false
+  const bytes = Buffer.byteLength(JSON.stringify(tail))
+  return bytes > REBASE_TAIL_MAX_BYTES || bytes * 2 > Buffer.byteLength(JSON.stringify(messages))
+}
+
+// agy keeps one writer per session. The agy that parked a session for a
+// rebase stops after it parks, in this host or in one a reload is
+// retiring while this host already takes its requests; the session is
+// resumed only once that process is gone. Bounded: past the wait, or with
+// no pid to check from another host, the request opens a new session and
+// replays, never resuming beside the old agy. A pid the system gave to
+// another process reads as alive, and ends the same way.
+function rebaseHolderWaitMs() {
+  return configuredTimeout("AGY_BRIDGE_REBASE_HOLDER_WAIT_MS", 6_000)
+}
+
+async function rebaseHolderGone(resume) {
+  // counted in the time slept, not by the clock (a clock set back or
+  // frozen would never end the wait)
+  let left = rebaseHolderWaitMs()
+  const stopping = stoppingSessions.get(resume.sessionId)
+  if (stopping) {
+    let timer
+    const done = await Promise.race([
+      stopping.catch(() => {}).then(() => true),
+      new Promise((resolve) => { timer = setTimeout(resolve, left, false) }),
+    ])
+    clearTimeout(timer)
+    if (!done) return false
+  }
+  const pid = resume.holder?.pid
+  if (!Number.isSafeInteger(pid) || pid <= 0) return resume.holder?.host === HOST_ID
+  while (processExists(pid)) {
+    if (left <= 0) return false
+    const step = Math.min(50, left)
+    await new Promise((resolve) => setTimeout(resolve, step))
+    left -= step
+  }
+  return true
+}
+
+// A live session the request can't go on in (an interrupted or steered turn
+// that won't steer, a history that differs past the session's last step, a
+// grown catalog) was replaced by a new session with the whole conversation
+// replayed into it. agy's system prompt names the session (its conversation
+// id and artifact folder), so a new one shares no prefix with the old and
+// the replay is read uncached, every time.
+// Instead the session is parked at the rows it is known to hold that the
+// client's history begins with, and the next acquire resumes it in its own
+// folder and sends what the client has after them (renderRebasedParts).
+// False when there are no such rows; the caller then replays, as before.
+function parkRebase(proc, turn, messages, history, opts, convKey) {
+  if (!proc.resumable || !proc.sessionId || !proc.hasSentFirstTurn || proc.historyInvalid || proc.seeding ||
+    proc.dead || proc.stopping || proc.retiring || proc.convKey !== convKey ||
+    proc.workDir !== opts.workDir || proc.media !== opts.media ||
+    !sameInstructions(proc.instructions, opts.instructions) ||
+    !Array.isArray(messages) || !Array.isArray(history)) return null
+  // Results agy already took that no row mark holds (a steer that answered
+  // its calls and then failed, a call the bridge answered itself): the
+  // session went on from them, and a rebased prompt would send them again
+  // as if new.
+  if (turn?.steering || turn?.calls?.some((call) => call.mcpResponded && !call.marked)) return null
+  // the rows may reach into the request's own last messages (the results
+  // agy already took), never all of them: something must follow
+  const rows = sessionPrefix(proc, turn, messages, messages.length - 1)
+  if (!rows) return null
+  if (rebaseTailTooBig(messages, rows.length, history.length)) return null
+  // the session holds a step past the rows the client never kept
+  const expected = Array.isArray(proc.expectedMessages) ? proc.expectedMessages : []
+  const beyond = rows.length < expected.length || !samePrefix(expected, rows, rows.length)
+  writeParked(proc, false, { rows, beyond, messages })
+  proc.rebaseParked = true
+  return rows
 }
 
 // Only a folder this bridge makes: the state file is never a way to run agy
@@ -4465,6 +4653,16 @@ function resumeWorkspace(workspace) {
   const resolved = path.resolve(workspace)
   if (path.dirname(resolved) !== path.resolve(os.tmpdir())) return null
   return /^magpie-agy-bridge-[A-Za-z0-9]{6}$/.test(path.basename(resolved)) ? resolved : null
+}
+
+// A rebase entry (parkRebase) is the request's that left the session: the
+// messages go on from all of it.
+function rebaseRequestTakes(entry, opts) {
+  const messages = opts.messages
+  return Array.isArray(messages) && Number.isSafeInteger(entry.count) && entry.count >= 1 &&
+    entry.count < messages.length && Number.isSafeInteger(entry.requestCount) &&
+    entry.requestCount >= entry.count && entry.requestCount <= messages.length &&
+    entry.requestHash === digest(historyKey(messages.slice(0, entry.requestCount)))
 }
 
 // Why no parked session was taken goes in `miss.reason`: counts and names
@@ -4490,10 +4688,16 @@ function takeParked(convKey, opts, miss = {}) {
     miss.reason = "none"
     return null
   }
+  // a rebase entry stays for the request it is for
+  if (entry.rebase && !rebaseRequestTakes(entry, opts)) {
+    miss.reason = "rebase"
+    return null
+  }
   parked.delete(key)
   unparked.add(key)
-  saveParked()
+  const saved = saveParked()
   miss.reason = Date.now() - entry.at > RESUME_TTL_MS ? "expired"
+    : entry.defaultAgent !== true ? "agent_mode"
     : (entry.workDir ?? null) !== (opts.workDir ?? null) ? "work_dir"
     // agy resumes a session with the tools it was opened with, whatever the
     // agent it runs now says: one opened without view_file can't read a video
@@ -4504,6 +4708,34 @@ function takeParked(convKey, opts, miss = {}) {
     : null
   if (miss.reason) return null
   const workspace = resumeWorkspace(entry.workspace)
+  // Parked for a rebase (parkRebase): taken only by the request that left
+  // the live session, its retry, or the same request reaching a host that
+  // started while the old one was stopping the session, and one going on
+  // from it: messages that begin with the whole request, not just with the
+  // shared rows (another branch of the conversation under the same key
+  // shares those too).
+  if (entry.rebase) {
+    const prefix = opts.messages.slice(0, entry.count)
+    if (!sameParkedHistory(entry, prefix)) {
+      miss.reason = "history"
+      return null
+    }
+    // the client's tail may have grown since the session was parked
+    if (rebaseTailTooBig(opts.messages, entry.count, Array.isArray(opts.history) ? opts.history.length : opts.messages.length - 1)) {
+      miss.reason = "rebase_tail"
+      return null
+    }
+    // taken for good only once the state file says so: the host that parked
+    // it removes the folder unless it was taken (Proc #stop)
+    if (!saved) {
+      miss.reason = "state_busy"
+      return null
+    }
+    return {
+      sessionId: entry.sessionId, expectedMessages: prefix, workspace, rebase: true, beyond: entry.beyond !== false,
+      holder: entry.holder ?? null,
+    }
+  }
   // A step parked mid-turn is taken only by its results: the request goes
   // on from the parked history with the model's calls and their results.
   if (entry.midTurn || opts.resumeStep) {
@@ -4979,6 +5211,13 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
       // where the history first differs from the session's, with no text,
       // as drop_live logs it (yetone/magpie#7223)
       if (why === "history") historyDiff = firstHistoryDiff(existing.expectedMessages, matchedHistory)
+      // An idle session that went on past rows the client never kept (a
+      // side question answered after a step's results, then left out of
+      // the next request: plugins#1693) resumes at the rows both still
+      // share, as a live turn the client left does (parkRebase), instead of
+      // a new session that replays everything and reads nothing cached.
+      if (!isFreshConversation && (why === "history" || (why === "forced" && opts.resumeStep)) &&
+        parkRebase(existing, null, opts.messages, opts.history, opts, convKey)) opts.rebase = true
     }
     if (!forceNew && launch && (statelessRequest(opts)
       ? statelessDonor(existing, launch, opts.userId || "", opts.sessionScope || "", opts.workDir)
@@ -4996,8 +5235,20 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   }
   // a tool result whose live call is gone (a restarted host) may still go
   // on in the session parked at its step (parkStep)
+<<<<<<< HEAD
   const parkMiss = { reason: isFreshConversation ? null : forceNew && !opts.resumeStep ? "forced" : null }
   const resume = isFreshConversation || (forceNew && !opts.resumeStep) ? null : takeParked(key, opts, parkMiss) // Parallel lanes (local patch): the lane's own key
+=======
+  // or the live session it left, parked for a rebase (parkRebase)
+  const parkMiss = { reason: isFreshConversation ? null : forceNew && !opts.resumeStep && !opts.rebase ? "forced" : null }
+  let resume = isFreshConversation || (forceNew && !opts.resumeStep && !opts.rebase) ? null : takeParked(convKey, opts, parkMiss)
+  // never two agy in one session: the one that parked it may still be
+  // stopping, in this host or another (rebaseHolderGone)
+  if (resume?.rebase && !(await rebaseHolderGone(resume))) {
+    parkMiss.reason = "holder_alive"
+    resume = null
+  } else if (resume) await stoppingSessions.get(resume.sessionId)?.catch(() => {})
+>>>>>>> upstream
   // a spare runs in a folder of its own, and a resumed session needs its own
   const spare = resume?.workspace ? null : await takeSpare(agyPath, opts.workDir, opts.media)
   while (!spare && allProcs.size >= maxProcs()) {
@@ -5025,16 +5276,18 @@ async function acquireProcLocked(agyPath, convKey, opts, isFreshConversation, fo
   // traced to the check that failed (#1058). Counts only, never content.
   proc.sessionReason = why
   proc.resumedStep = !!(proc.resumed && resume?.step)
+  proc.resumedRebase = proc.resumed && resume?.rebase ? { beyond: resume.beyond } : null
   logSessionEvent(proc, why, {
     fresh: !!isFreshConversation, resumed: !!proc.resumed, spare: !!spare,
     parked: !!resume, history: Array.isArray(opts.history) ? opts.history.length : null,
     ...parkMiss.reason ? { park_miss: parkMiss.reason } : {},
     ...resume && !proc.resumed ? { resume_failed: proc.resumeFailure ?? "unknown" } : {},
     ...resume?.step ? { step: true } : {},
+    ...resume?.rebase ? { rebase: resume.expectedMessages.length } : {},
     ...historyDiff !== undefined ? { first_diff: historyDiff } : {},
     ...proc.phases,
   })
-  return { proc, history: proc.resumedStep ? resume.expectedMessages : opts.history }
+  return { proc, history: proc.resumedStep || proc.resumedRebase ? resume.expectedMessages : opts.history }
 }
 
 // Open a stateless request's session in an idle agy that answered one
@@ -5232,7 +5485,8 @@ function droppedPendingCalls(turn, expected, base, history) {
 }
 
 // The client's rows are the session's, tool results included, with only user
-// text added after its last row: the step's tool results (plugins#1644).
+// text (and pictures) added after its last row: the step's tool results
+// (plugins#1644).
 function appendedUserText(want, got) {
   if (!want.length || got.length !== want.length) return false
   const n = want.length - 1
@@ -5250,7 +5504,9 @@ function appendedUserText(want, got) {
       !b[k].text.slice(a[k].text.length).trim()) return false
     extra = [b[k], ...extra]
   }
-  return extra.length > 0 && extra.every((block) => block.type === "text")
+  // a chat client's new message may carry pictures beside its text
+  return extra.some((block) => block.type === "text") &&
+    extra.every((block) => block.type === "text" || block.type === "image")
 }
 
 // Every tool_use of the turn's calls in messages has a tool_result after it.
@@ -8415,6 +8671,68 @@ function renderResumedStepParts(messages) {
     renderTurnMessagesParts(messages.filter((message) => message.role !== "assistant")))
 }
 
+// Where a rebased session and the client part, named by the last row they
+// share: the calls it carries or answers, by name and arguments (in a
+// tool loop "the results" alone could be any step's), else its opening
+// words.
+function rebaseCallSummary(block) {
+  let args = ""
+  try { args = JSON.stringify(block?.input ?? {}) ?? "" } catch {}
+  if (args.length > 80) args = `${args.slice(0, 80)}...`
+  return `${block?.name ?? "tool"} ${args}`.trim()
+}
+
+function rebaseAnchor(rows) {
+  const message = rows.at(-1)
+  const blocksOf = (row) => Array.isArray(row?.content) ? row.content : [{ type: "text", text: String(row?.content ?? "") }]
+  const blocks = blocksOf(message)
+  const own = message?.role === "assistant"
+  const plural = (list) => list.length > 1 ? "s" : ""
+  const results = blocks.filter((block) => block?.type === "tool_result")
+  if (results.length) {
+    const ids = new Set(results.map((block) => block.tool_use_id))
+    const calls = blocksOf(rows.at(-2)).filter((block) => block?.type === "tool_use" && ids.has(block.id))
+    if (calls.length) return `the results of your ${calls.map(rebaseCallSummary).join(", ")} call${plural(calls)}`
+  }
+  const calls = blocks.filter((block) => block?.type === "tool_use")
+  if (calls.length) return `your ${calls.map(rebaseCallSummary).join(", ")} call${plural(calls)}`
+  const text = blocks.filter((block) => block?.type === "text" && typeof block.text === "string")
+    .map((block) => block.text).join(" ").replace(/\s+/g, " ").trim()
+  if (text) {
+    const words = text.length > 80 ? `${text.slice(0, 80)}...` : text
+    return `${own ? "your message" : "the user's message"} that begins "${words}"`
+  }
+  if (results.length) return `the ${results.length} tool result${plural(results)} the client kept last`
+  return own ? "your last message the client kept" : "the user's last message the client kept"
+}
+
+// A session resumed for a rebase (parkRebase) holds the rows before
+// `after`, and, when `anchor` is given (those rows), steps of
+// its own past them that the client never kept: the prompt says where the
+// two part. What the client has after the rows goes in as the replay
+// renders it, with the request's own messages as the current turn.
+function renderRebasedParts(after, currentCount, anchor = null) {
+  const count = Math.max(0, Math.min(currentCount, after.length))
+  const tail = after.slice(0, after.length - count)
+  const current = after.slice(after.length - count)
+  const hasResults = current.some((message) => Array.isArray(message.content) &&
+    message.content.some((block) => block?.type === "tool_result"))
+  const note = anchor
+    ? `Everything in this session after ${rebaseAnchor(anchor)} is not in the client's conversation (the user interrupted or rewrote it); treat it as never done. `
+    : ""
+  if (!tail.length) {
+    const parts = hasResults ? renderResumedStepParts(current) : renderContinuedTurnParts(current)
+    return note ? mergePromptParts([{ type: "text", text: `${note}The conversation goes on from there:\n\n` }], parts) : parts
+  }
+  const out = []
+  appendPrompt(out, `${note}The conversation ${note ? "goes on from there" : "since then goes on"} as the client has it:\n\n<conversation_history>\n`)
+  for (const message of tail) appendPrompt(out, renderHistoryEntry(message))
+  appendPrompt(out, HISTORY_RECORD_NOTE + "</conversation_history>\n\n<current_turn>\n")
+  appendPrompt(out, toPromptParts(renderTurnMessagesSegments(current)))
+  appendPrompt(out, "\n</current_turn>")
+  return toPromptParts(out)
+}
+
 function validateBody(body) {
   if (!Array.isArray(body?.messages) || !body.messages.length) {
     throw new UnsupportedContent("a request without messages")
@@ -9684,7 +10002,7 @@ function streamResponse(proc, turn, body, signal, toolResultStep = null) {
   })
 }
 
-function bufferedAnthropicResponse(body, { msgId, model, content, stopReason }) {
+function bufferedAnthropicResponse(body, { msgId, model, content, stopReason, usage = null }) {
   const encoder = new TextEncoder()
   const stream = new ReadableStream({
     start(controller) {
@@ -9759,7 +10077,7 @@ function bufferedAnthropicResponse(body, { msgId, model, content, stopReason }) 
       send("message_delta", {
         type: "message_delta",
         delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { input_tokens: 0, output_tokens: 0 },
+        usage: usage ?? { input_tokens: 0, output_tokens: 0 },
       })
       send("message_stop", { type: "message_stop" })
       controller.close()
@@ -9803,6 +10121,11 @@ async function beginTurn(proc, history, body, callerWorkDir, model, selection, a
   if (!isFirstTurn && proc.resumedStep) {
     proc.resumedStep = false
     baseParts = renderResumedStepParts(messages.slice(history.length))
+  } else if (!isFirstTurn && proc.resumedRebase) {
+    const { beyond } = proc.resumedRebase
+    proc.resumedRebase = null
+    baseParts = renderRebasedParts(messages.slice(history.length), trailingMessages(body).messages.length,
+      beyond ? history : null)
   } else if (!isFirstTurn) {
     baseParts = renderContinuedTurnParts(flattened
       ? [flattened, ...messages.slice(1)]
@@ -10306,6 +10629,33 @@ export const AntigravityBridgePlugin = async () => {
               return jsonError(400, `agy bridge: video or audio input to ${requestedModel} is not supported. Choose a Gemini model`, undefined, { noRetry: true })
             }
             const selection = { model: requestedModel, effort: requestedEffort(body, saidEffort) }
+            // Claude Code's AgentSummary in short notes (opt-in, plugins#1701):
+            // answered by a one-shot, tool-free agy on the resolved model,
+            // before anything reads the worker's history or tool results
+            const summary = agentSummaryRewrite(body, {
+              mode: agentSummaryMode(),
+              callerAgent: requestHeader(fetchInput, init, "x-magpie-caller-agent"),
+              subagent: requestHeader(fetchInput, init, "x-magpie-subagent"),
+            })
+            if (summary) {
+              logBridgeEvent(null, null, "agent_summary", summary.kind, { convKey },
+                { full_bytes: summary.fullBytes, short_bytes: summary.shortBytes, ...(summary.steps != null ? { steps: summary.steps } : {}) })
+              try {
+                const done = await runAgentSummary(summary, {
+                  model,
+                  signal: init?.signal ?? fetchInput?.signal,
+                  deps: { agyPath: agy, agyTooOld, clientInfo: CLIENT_INFO, noDefaultCustomizationsArgs, telemetryArgs, geminiDirArgs, refusalNow, classifyAgyFailure },
+                })
+                return bufferedAnthropicResponse(body, {
+                  msgId: "msg_" + randomUUID().replace(/-/g, "").slice(0, 24),
+                  model: rawModel, content: [{ type: "text", text: done.label }], stopReason: "end_turn",
+                  usage: translateUsage(done.usage),
+                })
+              } catch (error) {
+                return jsonError(error?.statusCode ?? 502, error?.message || String(error), error?.code,
+                  { headers: { ...(error?.noRetry ? NO_RETRY_HEADERS : {}), ...(error?.headers ?? {}) } })
+              }
+            }
             // the key before the model line left it (0.1.142 and older)
             const legacyConvKey = (home ? `acct:${path.basename(home)}:` : "") + conversationKey(body, sessionScope, callerWorkDir || "", true)
             const trailing = trailingMessages(body)
@@ -10510,9 +10860,20 @@ export const AntigravityBridgePlugin = async () => {
                       first_diff: historyMatches ? null : firstHistoryDiff(proc.expectedMessages, trailingMessages(body).history),
                     })
                     acquireOpts.dropReason = dropReason
+                    // the same session, resumed at the rows it shares with
+                    // the client, instead of a new one (parkRebase)
+                    const rebaseRows = dropReason === "prefill" ? null
+                      : parkRebase(proc, turn, body.messages, trailingMessages(body).history, acquireOpts, convKey)
                     dropFromPool(proc)
-                    proc.abandonTurn(turn)
-                    await proc.stop()
+                    if (rebaseRows) {
+                      acquireOpts.rebase = true
+                      proc.forgetCalls(turn)
+                      await proc.stop()
+                      proc.abandonTurn(turn)
+                    } else {
+                      proc.abandonTurn(turn)
+                      await proc.stop()
+                    }
                   } else {
                     let toolResultStep = null
                     if (!proc.dead && !turn.done) {
